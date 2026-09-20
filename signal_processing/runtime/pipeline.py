@@ -1,0 +1,635 @@
+"""End-to-end streaming capture and feature processing pipeline."""
+
+from __future__ import annotations
+
+import enum
+import math
+from typing import Literal
+
+import numpy as np
+
+from signal_processing.buffering.ring_buffer import CircularIQBuffer
+from signal_processing.capture.assembler import EventAssembler
+from signal_processing.capture.sidecar import CaptureSidecar
+from signal_processing.context import AnalysisConfig
+from signal_processing.core.contracts import IQBlock, StreamInfo
+from signal_processing.core.enums import SegmentState, SegmentTransition
+from signal_processing.core.exceptions import StreamConsistencyError
+from signal_processing.core.interfaces import NoiseEstimatorProtocol
+from signal_processing.detection.energy_detector import EnergyDetector
+from signal_processing.detection.exceptions import UncalibratedNoiseError
+from signal_processing.detection.noise_estimation import (
+    GaussianNoiseEstimator,
+    NoiseLifecycleState,
+    ThresholdPolicy,
+)
+from signal_processing.runtime.worker import FeatureAnalysisWorker
+from signal_processing.segmentation.segmenter import HysteresisSegmenter
+
+
+class PipelineState(enum.Enum):
+    """Lifecycle states for StreamingCapturePipeline."""
+
+    OPEN = "OPEN"
+    EOF = "EOF"
+    FAULTED = "FAULTED"
+
+
+class StreamingCapturePipeline:
+    """Integrated streaming signal detection, segmentation, and feature extraction pipeline.
+
+    Processes incoming continuous IQBlock streams:
+      1. Validates stream metadata and sequence continuity.
+      2. Appends raw IQ into preallocated circular ring buffer using bounded chunking.
+      3. Performs causal windowed energy detection (full-band or configured-band).
+      4. Drives the hysteresis persistence segmentation state machine.
+      5. Gathers pre-trigger history and trailing margins into SignalEvents.
+      6. Applies capture quality gating and dispatches completed events to feature analysis.
+    """
+
+    def __init__(
+        self,
+        stream_info: StreamInfo,
+        ring_capacity: int = 16_384,
+        window_size: int = 256,
+        hop_size: int = 64,
+        pfa_on: float = 1e-4,
+        pfa_off: float = 1e-2,
+        detector_mode: Literal["full_band", "configured_band"] = "full_band",
+        monitored_band_hz: tuple[float, float] | None = None,
+        noise_estimator: NoiseEstimatorProtocol | None = None,
+        start_persistence: int = 2,
+        end_persistence: int = 5,
+        pre_trigger_samples: int = 512,
+        pre_signal_margin_samples: int = 256,
+        post_signal_samples: int = 256,
+        min_post_trigger_samples: int = 512,
+        max_event_samples: int = 100_000,
+        synchronous_analysis: bool = True,
+        skip_incomplete_quality: bool = True,
+        enable_feature_analysis: bool = True,
+        max_worker_queue_size: int = 32,
+        analysis_config: AnalysisConfig | None = None,
+        threshold_policy: ThresholdPolicy | None = None,
+    ) -> None:
+        if isinstance(window_size, bool) or not isinstance(window_size, (int, np.integer)) or window_size < 1:
+            raise ValueError(f"window_size must be an integer >= 1, got {window_size!r}")
+        if isinstance(hop_size, bool) or not isinstance(hop_size, (int, np.integer)) or not (1 <= hop_size <= window_size):
+            raise ValueError(f"hop_size must satisfy 1 <= hop_size <= window_size, got {hop_size!r}")
+        if not (0.0 < pfa_on < pfa_off < 1.0):
+            raise ValueError("False alarm probabilities must satisfy 0 < pfa_on < pfa_off < 1")
+        if isinstance(start_persistence, bool) or not isinstance(start_persistence, (int, np.integer)) or start_persistence < 1:
+            raise ValueError(f"start_persistence must be an integer >= 1, got {start_persistence!r}")
+        if isinstance(end_persistence, bool) or not isinstance(end_persistence, (int, np.integer)) or end_persistence < 1:
+            raise ValueError(f"end_persistence must be an integer >= 1, got {end_persistence!r}")
+        if isinstance(ring_capacity, bool) or not isinstance(ring_capacity, (int, np.integer)) or ring_capacity < 1:
+            raise ValueError(f"ring_capacity must be an integer >= 1, got {ring_capacity!r}")
+        if isinstance(pre_trigger_samples, bool) or not isinstance(pre_trigger_samples, (int, np.integer)) or pre_trigger_samples < 0:
+            raise ValueError(f"pre_trigger_samples must be >= 0, got {pre_trigger_samples!r}")
+        if isinstance(pre_signal_margin_samples, bool) or not isinstance(pre_signal_margin_samples, (int, np.integer)) or pre_signal_margin_samples < 0:
+            raise ValueError(f"pre_signal_margin_samples must be >= 0, got {pre_signal_margin_samples!r}")
+        if isinstance(post_signal_samples, bool) or not isinstance(post_signal_samples, (int, np.integer)) or post_signal_samples < 0:
+            raise ValueError(f"post_signal_samples must be >= 0, got {post_signal_samples!r}")
+        if isinstance(min_post_trigger_samples, bool) or not isinstance(min_post_trigger_samples, (int, np.integer)) or min_post_trigger_samples < 0:
+            raise ValueError(f"min_post_trigger_samples must be >= 0, got {min_post_trigger_samples!r}")
+        if isinstance(max_event_samples, bool) or not isinstance(max_event_samples, (int, np.integer)) or max_event_samples < 2:
+            raise ValueError(f"max_event_samples must be >= 2, got {max_event_samples!r}")
+        if detector_mode not in ("full_band", "configured_band"):
+            raise ValueError(f"Unknown detector_mode: {detector_mode!r}. Must be 'full_band' or 'configured_band'")
+
+        # Joint limit validation
+        min_event_extent = max(
+            pre_trigger_samples + 1,
+            (start_persistence - 1) * hop_size + window_size + pre_signal_margin_samples,
+        )
+        if max_event_samples < min_event_extent:
+            raise ValueError(
+                f"Incompatible capture configuration: max_event_samples ({max_event_samples}) "
+                f"must be at least {min_event_extent} samples to span detector window/margins"
+            )
+
+        self._stream_info = stream_info
+        self._state = PipelineState.OPEN
+
+        self._detector = EnergyDetector(
+            window_size=window_size,
+            hop_size=hop_size,
+            pfa_on=pfa_on,
+            pfa_off=pfa_off,
+            mode=detector_mode,
+            monitored_band_hz=monitored_band_hz,
+            sample_rate_hz=stream_info.sample_rate_hz,
+            threshold_policy=threshold_policy,
+        )
+
+        filter_delay = getattr(self._detector, "filter_delay_samples", 0)
+        min_required_history = (
+            pre_trigger_samples
+            + pre_signal_margin_samples
+            + start_persistence * hop_size
+            + window_size
+            + filter_delay
+        )
+        if ring_capacity <= min_required_history:
+            raise ValueError(
+                f"ring_capacity ({ring_capacity}) is insufficient for requested retention policy "
+                f"(requires strictly more than {min_required_history} samples)"
+            )
+        self._min_required_history = min_required_history
+
+        self._ring = CircularIQBuffer(capacity=ring_capacity)
+
+        if noise_estimator is not None:
+            self._noise_estimator = noise_estimator
+        else:
+            self._noise_estimator = GaussianNoiseEstimator(
+                window_size=window_size,
+                pfa_on=pfa_on,
+                pfa_off=pfa_off,
+            )
+
+        self._segmenter = HysteresisSegmenter(
+            start_persistence=start_persistence,
+            end_persistence=end_persistence,
+            max_event_samples=max_event_samples,
+        )
+
+        self._assembler = EventAssembler(
+            ring_buffer=self._ring,
+            pre_trigger_samples=pre_trigger_samples,
+            pre_signal_margin_samples=pre_signal_margin_samples,
+            post_signal_samples=post_signal_samples,
+            min_post_trigger_samples=min_post_trigger_samples,
+            max_event_samples=max_event_samples,
+            window_size=window_size,
+            hop_size=hop_size,
+            start_persistence=start_persistence,
+        )
+
+        self._worker = FeatureAnalysisWorker(
+            max_queue_size=max_worker_queue_size,
+            skip_incomplete_quality=skip_incomplete_quality,
+            synchronous=synchronous_analysis,
+            analysis_config=analysis_config,
+        )
+
+        self._enable_feature_analysis = bool(enable_feature_analysis)
+        self._previous_block: IQBlock | None = None
+        self._pending_noise_iq: list[np.ndarray] = []
+        self._input_residual_iq: np.ndarray = np.empty(0, dtype=np.complex64)
+        self._input_residual_start: int = 0
+
+    def _dispatch_event(self, sidecar: CaptureSidecar) -> CaptureSidecar:
+        """Route finalized event through feature worker or return directly if feature analysis is disabled."""
+        if not self._enable_feature_analysis:
+            return sidecar.with_features(
+                features=None,
+                feature_status="skipped",
+                feature_reason="Feature extraction disabled (capture-only mode)",
+            )
+        return self._worker.submit(sidecar)
+
+    @property
+    def state(self) -> PipelineState:
+        return self._state
+
+    @property
+    def ring_buffer(self) -> CircularIQBuffer:
+        return self._ring
+
+    @property
+    def detector(self) -> EnergyDetector:
+        return self._detector
+
+    @property
+    def noise_estimator(self) -> NoiseEstimatorProtocol:
+        return self._noise_estimator
+
+    @property
+    def segmenter(self) -> HysteresisSegmenter:
+        return self._segmenter
+
+    @property
+    def assembler(self) -> EventAssembler:
+        return self._assembler
+
+    @property
+    def worker(self) -> FeatureAnalysisWorker:
+        return self._worker
+
+    @property
+    def feature_worker(self) -> FeatureAnalysisWorker:
+        return self._worker
+
+    def process_block(self, block: IQBlock) -> list[CaptureSidecar]:
+        """Process incoming IQBlock chunk through the streaming pipeline."""
+        if self._state == PipelineState.EOF:
+            raise RuntimeError("Cannot process block: pipeline is at EOF. Call reset() to restart.")
+        if self._state == PipelineState.FAULTED:
+            raise RuntimeError("Cannot process block: pipeline is in FAULTED state. Call reset() to recover.")
+
+        emitted: list[CaptureSidecar] = []
+
+        # Validate complex dtype before mutation
+        if not np.iscomplexobj(block.iq):
+            raise StreamConsistencyError(f"Block IQ data must be complex dtype, got {block.iq.dtype}")
+
+        # 1. Stream validation before mutating state
+        if self._previous_block is None:
+            if block.stream.stream_id != self._stream_info.stream_id:
+                raise StreamConsistencyError(
+                    f"First block stream_id '{block.stream.stream_id}' does not match "
+                    f"pipeline stream_id '{self._stream_info.stream_id}'"
+                )
+            if hasattr(self._stream_info, "source_id") and hasattr(block.stream, "source_id"):
+                if block.stream.source_id != self._stream_info.source_id:
+                    raise StreamConsistencyError(
+                        f"First block source_id '{block.stream.source_id}' does not match "
+                        f"pipeline source_id '{self._stream_info.source_id}'"
+                    )
+            if hasattr(self._stream_info, "channel_id") and hasattr(block.stream, "channel_id"):
+                if block.stream.channel_id != self._stream_info.channel_id:
+                    raise StreamConsistencyError(
+                        f"First block channel_id '{block.stream.channel_id}' does not match "
+                        f"pipeline channel_id '{self._stream_info.channel_id}'"
+                    )
+            if not math.isclose(block.stream.sample_rate_hz, self._stream_info.sample_rate_hz, rel_tol=1e-9):
+                raise StreamConsistencyError(
+                    f"First block sample rate {block.stream.sample_rate_hz} Hz does not match "
+                    f"pipeline sample rate {self._stream_info.sample_rate_hz} Hz"
+                )
+            if self._stream_info.center_frequency_hz is not None:
+                if block.stream.center_frequency_hz is None or not math.isclose(
+                    block.stream.center_frequency_hz, self._stream_info.center_frequency_hz, rel_tol=1e-9
+                ):
+                    raise StreamConsistencyError(
+                        f"First block center frequency {block.stream.center_frequency_hz} Hz does not match "
+                        f"pipeline center frequency {self._stream_info.center_frequency_hz} Hz"
+                    )
+            elif block.stream.center_frequency_hz is not None:
+                # Adopt center frequency ONLY after validating first block!
+                self._stream_info = StreamInfo(
+                    stream_id=self._stream_info.stream_id,
+                    source_id=getattr(self._stream_info, "source_id", "default"),
+                    sample_rate_hz=self._stream_info.sample_rate_hz,
+                    center_frequency_hz=block.stream.center_frequency_hz,
+                    channel_id=getattr(self._stream_info, "channel_id", "default"),
+                    dtype=getattr(self._stream_info, "dtype", "complex64"),
+                )
+            if block.dropped_samples_before > 0 or block.overflow:
+                self._ring.reset(start_sample=block.start_sample)
+        else:
+            # Metadata must match ALWAYS, even if loss is declared
+            if block.stream.stream_id != self._stream_info.stream_id:
+                raise StreamConsistencyError(
+                    f"Stream ID mismatch: expected '{self._stream_info.stream_id}', got '{block.stream.stream_id}'"
+                )
+            if hasattr(self._stream_info, "source_id") and hasattr(block.stream, "source_id"):
+                if block.stream.source_id != self._stream_info.source_id:
+                    raise StreamConsistencyError(
+                        f"Source ID mismatch: expected '{self._stream_info.source_id}', got '{block.stream.source_id}'"
+                    )
+            if hasattr(self._stream_info, "channel_id") and hasattr(block.stream, "channel_id"):
+                if block.stream.channel_id != self._stream_info.channel_id:
+                    raise StreamConsistencyError(
+                        f"Channel ID mismatch: expected '{self._stream_info.channel_id}', got '{block.stream.channel_id}'"
+                    )
+            if not math.isclose(block.stream.sample_rate_hz, self._stream_info.sample_rate_hz, rel_tol=1e-9):
+                raise StreamConsistencyError(
+                    f"Sample rate mismatch: expected {self._stream_info.sample_rate_hz} Hz, got {block.stream.sample_rate_hz} Hz"
+                )
+            prev_cf = self._previous_block.stream.center_frequency_hz
+            curr_cf = block.stream.center_frequency_hz
+            if (prev_cf is None) != (curr_cf is None):
+                raise StreamConsistencyError(
+                    f"Incompatible center frequency configuration: previous={prev_cf}, current={curr_cf}"
+                )
+            if prev_cf is not None and curr_cf is not None and not math.isclose(prev_cf, curr_cf, rel_tol=1e-9):
+                raise StreamConsistencyError("Center frequency mismatch between consecutive blocks")
+
+            # Check sequence ordering
+            if block.sequence_number <= self._previous_block.sequence_number:
+                raise StreamConsistencyError(
+                    f"Duplicate or out-of-order block sequence number: previous="
+                    f"{self._previous_block.sequence_number}, current={block.sequence_number}"
+                )
+
+            # Check coordinate continuity & declared drops
+            expected_start = self._previous_block.end_sample + block.dropped_samples_before
+            if not block.overflow:
+                if block.start_sample != expected_start:
+                    gap = block.start_sample - self._previous_block.end_sample
+                    raise StreamConsistencyError(
+                        f"Unexplained sample discontinuity: previous block ended at {self._previous_block.end_sample}, "
+                        f"current block starts at {block.start_sample} (gap of {gap} samples), "
+                        f"but declared dropped_samples_before is {block.dropped_samples_before}"
+                    )
+                if block.dropped_samples_before == 0 and block.sequence_number != self._previous_block.sequence_number + 1:
+                    raise StreamConsistencyError(
+                        f"Sequence jump without declared sample drop: previous={self._previous_block.sequence_number}, "
+                        f"current={block.sequence_number}"
+                    )
+            else:
+                if block.start_sample < self._previous_block.end_sample:
+                    raise StreamConsistencyError("Sample index overlap backwards during overflow")
+
+            if block.dropped_samples_before > 0 or block.overflow:
+                # Write any residual from before the gap into ring buffer before handling discontinuity
+                if len(self._input_residual_iq) > 0:
+                    self._ring.write(self._input_residual_start, self._input_residual_iq)
+                    self._input_residual_iq = np.empty(0, dtype=np.complex64)
+
+                # Discontinuity: terminate in-flight capture
+                discont_sidecar = self._assembler.handle_discontinuity(
+                    dropped_samples=block.dropped_samples_before,
+                    overflow=block.overflow,
+                )
+                if discont_sidecar is not None:
+                    self._segmenter.finish_event()
+                    analyzed = self._dispatch_event(discont_sidecar)
+                    emitted.append(analyzed)
+
+                self._detector.reset()
+                if isinstance(self._noise_estimator, GaussianNoiseEstimator):
+                    if not self._noise_estimator.is_calibrated:
+                        self._noise_estimator.reset()
+                else:
+                    self._noise_estimator.reset()
+
+                self._worker.advance_generation()
+                self._ring.reset(start_sample=block.start_sample)
+                self._segmenter.reset()
+                self._pending_noise_iq.clear()
+                self._input_residual_iq = np.empty(0, dtype=np.complex64)
+
+        # Update assembler timestamp anchor (discard trust after unknown overflow)
+        if block.overflow:
+            self._assembler.set_timestamp_anchor(block.start_sample, None)
+        elif block.timestamp_ns is not None:
+            self._assembler.set_timestamp_anchor(block.start_sample, block.timestamp_ns)
+
+        # Check noise estimator status before mutating ring buffer state (B06 / C02)
+        is_calibrating = False
+        if hasattr(self._noise_estimator, "state"):
+            est_state = self._noise_estimator.state
+            if est_state == NoiseLifecycleState.UNCALIBRATED:
+                self._state = PipelineState.FAULTED
+                raise UncalibratedNoiseError("Cannot process block: noise estimator is uncalibrated")
+            elif est_state == NoiseLifecycleState.STALE:
+                self._state = PipelineState.FAULTED
+                raise UncalibratedNoiseError("Cannot process block: noise estimator is stale")
+            elif est_state == NoiseLifecycleState.INVALID:
+                self._state = PipelineState.FAULTED
+                raise UncalibratedNoiseError("Cannot process block: noise estimator is invalid")
+            elif est_state == NoiseLifecycleState.CALIBRATING:
+                is_calibrating = True
+        elif hasattr(self._noise_estimator, "is_calibrated") and not self._noise_estimator.is_calibrated:
+            warmup_blocks = getattr(self._noise_estimator, "_warmup_blocks", 0)
+            warmup_samples = getattr(self._noise_estimator, "_warmup_samples", 0)
+            if warmup_blocks == 0 and warmup_samples == 0:
+                self._state = PipelineState.FAULTED
+                raise UncalibratedNoiseError("Cannot process block: noise estimator is uncalibrated")
+            is_calibrating = True
+
+        if is_calibrating:
+            # During warmup, consume only authorized prefix (B01 / C03)
+            consumed = 0
+            cal_iq = self._detector.prepare_detection_iq(block.iq) if self._detector.mode == "configured_band" else block.iq
+            if hasattr(self._noise_estimator, "update_samples"):
+                consumed = self._noise_estimator.update_samples(cal_iq)
+            elif hasattr(self._noise_estimator, "update"):
+                warmup_block = IQBlock(
+                    stream=block.stream,
+                    sequence_number=block.sequence_number,
+                    start_sample=block.start_sample,
+                    timestamp_ns=block.timestamp_ns,
+                    iq=cal_iq,
+                    dropped_samples_before=block.dropped_samples_before,
+                    overflow=block.overflow,
+                )
+                self._noise_estimator.update(warmup_block)
+                consumed = len(block.iq)
+
+            self._ring.write(block.start_sample, block.iq[:consumed])
+
+            still_calibrating = False
+            if hasattr(self._noise_estimator, "state"):
+                still_calibrating = (self._noise_estimator.state == NoiseLifecycleState.CALIBRATING)
+            elif hasattr(self._noise_estimator, "is_calibrated"):
+                still_calibrating = not self._noise_estimator.is_calibrated
+
+            if still_calibrating or consumed >= len(block.iq):
+                self._previous_block = block
+                return []
+
+            # Calibration budget reached inside this block!
+            block = IQBlock(
+                stream=block.stream,
+                sequence_number=block.sequence_number,
+                start_sample=block.start_sample + consumed,
+                timestamp_ns=None,
+                iq=block.iq[consumed:],
+                dropped_samples_before=0,
+                overflow=False,
+            )
+
+        self._previous_block = block
+
+        # Combine block with preceding input residual (C01 / C02)
+        if len(self._input_residual_iq) > 0:
+            combined_iq = np.concatenate([self._input_residual_iq, block.iq])
+            combined_start = self._input_residual_start
+        else:
+            combined_iq = block.iq
+            combined_start = block.start_sample
+
+        hop_size = self._detector.hop_size
+        num_hops = len(combined_iq) // hop_size
+
+        for h_idx in range(num_hops):
+            h_start = h_idx * hop_size
+            h_end = h_start + hop_size
+            hop_iq = combined_iq[h_start:h_end]
+            hop_start_sample = combined_start + h_start
+
+            # Check noise estimator status at logical hop coordinate (B06 / C01)
+            if hasattr(self._noise_estimator, "state"):
+                est_state = self._noise_estimator.state
+                if est_state == NoiseLifecycleState.UNCALIBRATED:
+                    self._state = PipelineState.FAULTED
+                    raise UncalibratedNoiseError("Cannot process block: noise estimator is uncalibrated")
+                elif est_state == NoiseLifecycleState.STALE:
+                    self._state = PipelineState.FAULTED
+                    raise UncalibratedNoiseError("Cannot process block: noise estimator is stale")
+                elif est_state == NoiseLifecycleState.INVALID:
+                    self._state = PipelineState.FAULTED
+                    raise UncalibratedNoiseError("Cannot process block: noise estimator is invalid")
+
+            # Write this hop to ring buffer
+            self._ring.write(hop_start_sample, hop_iq)
+
+            hop_block = IQBlock(
+                stream=block.stream,
+                sequence_number=block.sequence_number,
+                start_sample=hop_start_sample,
+                timestamp_ns=None,
+                iq=hop_iq,
+                dropped_samples_before=0,
+                overflow=False,
+            )
+
+            if hasattr(self._noise_estimator, "get_estimate"):
+                noise_est = self._noise_estimator.get_estimate(block.stream.stream_id, block.sequence_number)
+            else:
+                noise_est = self._noise_estimator.update(hop_block)
+
+            measurements = self._detector.process_windows(hop_block, noise_est)
+
+            if self._detector.mode == "configured_band":
+                det_iq = self._detector.last_detection_iq
+            else:
+                det_iq = hop_iq
+            self._pending_noise_iq.append(det_iq)
+
+            hop_had_burst = False
+
+            for meas in measurements:
+                horizon = meas.end_sample
+
+                if self._assembler.is_in_flight:
+                    self._assembler.update_active(horizon)
+
+                target_end = self._assembler.target_end_sample
+                if self._assembler.is_in_flight and target_end is not None:
+                    if target_end < horizon:
+                        sidecar = self._assembler.check_finalization()
+                        if sidecar is not None:
+                            self._segmenter.finish_event()
+                            analyzed = self._dispatch_event(sidecar)
+                            emitted.append(analyzed)
+                    elif target_end == horizon and not meas.above_on_threshold:
+                        sidecar = self._assembler.check_finalization()
+                        if sidecar is not None:
+                            self._segmenter.finish_event()
+                            analyzed = self._dispatch_event(sidecar)
+                            emitted.append(analyzed)
+
+                is_active_or_candidate = (
+                    self._segmenter.state != SegmentState.IDLE
+                    or meas.above_on_threshold
+                    or self._segmenter._on_count > 0
+                )
+                if is_active_or_candidate:
+                    hop_had_burst = True
+
+                if hasattr(self._noise_estimator, "freeze"):
+                    self._noise_estimator.freeze(is_active_or_candidate)
+
+                prev_state = self._segmenter.state
+                decision = self._segmenter.update(meas)
+
+                if prev_state == SegmentState.POST_TRIGGER and decision.state == SegmentState.ACTIVE:
+                    self._assembler.reopen()
+
+                if decision.transition == SegmentTransition.START:
+                    assert self._segmenter.first_on_sample is not None
+                    assert self._segmenter.confirmation_sample is not None
+                    assert self._segmenter.trigger_sample is not None
+                    assert self._segmenter.detected_start_sample is not None
+
+                    self._assembler.start_capture(
+                        stream_info=block.stream,
+                        first_on_sample=self._segmenter.first_on_sample,
+                        confirmation_sample=self._segmenter.confirmation_sample,
+                        trigger_sample=self._segmenter.trigger_sample,
+                        detected_start_sample=self._segmenter.detected_start_sample,
+                        detector_mode=self._detector.mode,
+                        monitored_band_hz=self._detector.monitored_band_hz,
+                        noise_provenance=type(self._noise_estimator).__name__,
+                        noise_valid=noise_est.valid,
+                        boundary_uncertainty=None,
+                        decision_horizon=horizon,
+                    )
+                elif decision.transition == SegmentTransition.END:
+                    assert self._segmenter.detected_end_sample is not None
+                    assert self._segmenter.end_confirmation_sample is not None
+                    self._assembler.end_capture(
+                        detected_end_sample=self._segmenter.detected_end_sample,
+                        end_confirmation_sample=self._segmenter.end_confirmation_sample,
+                    )
+
+                if (
+                    self._assembler.is_in_flight
+                    and self._assembler.target_end_sample is not None
+                    and horizon >= self._assembler.target_end_sample
+                ):
+                    sidecar = self._assembler.check_finalization()
+                    if sidecar is not None:
+                        self._segmenter.finish_event()
+                        analyzed = self._dispatch_event(sidecar)
+                        emitted.append(analyzed)
+
+            # Causal adaptation tracking per hop (B02 & B03 & C01)
+            if len(measurements) == 0:
+                pass
+            elif hop_had_burst or self._segmenter.state != SegmentState.IDLE:
+                unaccepted = sum(len(p) for p in self._pending_noise_iq)
+                self._pending_noise_iq.clear()
+                if unaccepted > 0 and hasattr(self._noise_estimator, "advance_stream_samples"):
+                    self._noise_estimator.advance_stream_samples(unaccepted)
+            else:
+                if hasattr(self._noise_estimator, "update_samples"):
+                    for chunk in self._pending_noise_iq:
+                        self._noise_estimator.update_samples(chunk)
+                self._pending_noise_iq.clear()
+
+        # Update input residual for remaining samples
+        rem_offset = num_hops * hop_size
+        if rem_offset < len(combined_iq):
+            self._input_residual_iq = combined_iq[rem_offset:]
+            self._input_residual_start = combined_start + rem_offset
+        else:
+            self._input_residual_iq = np.empty(0, dtype=np.complex64)
+            self._input_residual_start = combined_start + len(combined_iq)
+
+        return emitted
+
+    def flush(self) -> list[CaptureSidecar]:
+        """Flush pipeline at stream EOF. Finalizes any in-flight capture."""
+        emitted: list[CaptureSidecar] = []
+        if self._state == PipelineState.EOF:
+            return emitted
+
+        if len(self._input_residual_iq) > 0:
+            self._ring.write(self._input_residual_start, self._input_residual_iq)
+            self._input_residual_iq = np.empty(0, dtype=np.complex64)
+
+        if self._assembler.is_in_flight:
+            eof_sidecar = self._assembler.flush_eof()
+            if eof_sidecar is not None:
+                self._segmenter.finish_event()
+                analyzed = self._dispatch_event(eof_sidecar)
+                emitted.append(analyzed)
+
+        self._state = PipelineState.EOF
+        return emitted
+
+    finalize = flush
+
+    def reset(self) -> None:
+        """Reset all components to initial state."""
+        self._state = PipelineState.OPEN
+        self._ring.reset()
+        self._detector.reset()
+        self._noise_estimator.reset()
+        self._segmenter.reset()
+        self._assembler.reset()
+        self._worker.reset()
+        self._previous_block = None
+        self._pending_noise_iq.clear()
+        self._input_residual_iq = np.empty(0, dtype=np.complex64)
+        self._input_residual_start = 0
+
+    def shutdown(self, drain: bool = True, timeout: float = 5.0) -> None:
+        """Shutdown worker thread."""
+        self._worker.shutdown(drain=drain, timeout=timeout)
