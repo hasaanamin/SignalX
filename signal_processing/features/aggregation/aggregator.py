@@ -176,6 +176,7 @@ class FeatureAggregator:
             resolved_bw_roi = list(bw_cfg.roi_hz) if bw_cfg.roi_hz is not None else None
             resolved_bw_noise_floor = bw_cfg.noise_floor_dbfs_per_hz
             resolved_bw_min_snr = float(bw_cfg.min_snr_db) if getattr(bw_cfg, "min_snr_db", None) is not None else None
+            resolved_check_edge_clipping = bool(getattr(bw_cfg, "check_edge_clipping", True))
         else:
             resolved_bw_mode = str(getattr(cfg, "bandwidth_mode", "raw_psd"))
             resolved_bw_interp = bool(getattr(cfg, "bandwidth_interpolate_edges", False))
@@ -183,6 +184,7 @@ class FeatureAggregator:
             resolved_bw_roi = list(cfg.bandwidth_roi_hz) if getattr(cfg, "bandwidth_roi_hz", None) is not None else None
             resolved_bw_noise_floor = getattr(cfg, "bandwidth_noise_floor_dbfs_per_hz", None)
             resolved_bw_min_snr = getattr(cfg, "bandwidth_min_snr_db", None)
+            resolved_check_edge_clipping = bool(getattr(cfg, "bandwidth_check_edge_clipping", True))
 
         resolved_amplitude_ddof = (
             getattr(amp_ext, "_config", None).ddof
@@ -212,6 +214,7 @@ class FeatureAggregator:
             "bandwidth_roi_hz": resolved_bw_roi,
             "bandwidth_noise_floor_dbfs_per_hz": resolved_bw_noise_floor,
             "bandwidth_min_snr_db": resolved_bw_min_snr,
+            "check_edge_clipping": resolved_check_edge_clipping,
             "extractor_versions": {ext.name: ext.version for ext in self._registry.extractors},
             "feature_names": sorted(vector.features.keys()),
         }
@@ -242,6 +245,9 @@ class FeatureAggregator:
             power_floor_dbfs=resolved_p_floor,
             psd_floor_dbfs_per_hz=resolved_psd_floor,
             bandwidth_min_snr_db=resolved_bw_min_snr,
+            amplitude_ddof=int(resolved_amplitude_ddof),
+            check_edge_clipping=resolved_check_edge_clipping,
+            extractor_versions={ext.name: ext.version for ext in self._registry.extractors},
         )
 
         return AnalysisResult(

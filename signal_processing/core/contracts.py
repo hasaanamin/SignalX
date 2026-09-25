@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Iterable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import Any
 
@@ -1273,6 +1273,9 @@ class ExtractionPolicy:
     power_floor_dbfs: float = -300.0
     psd_floor_dbfs_per_hz: float = -300.0
     bandwidth_min_snr_db: float | None = None
+    amplitude_ddof: int = 1
+    check_edge_clipping: bool = True
+    extractor_versions: dict[str, str] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         _validate_non_blank_str(self.policy_id, "policy_id")
@@ -1284,6 +1287,9 @@ class ExtractionPolicy:
         _validate_non_blank_str(self.spectral_window, "spectral_window")
         if not isinstance(self.feature_names, tuple):
             object.__setattr__(self, "feature_names", tuple(self.feature_names))
+        if isinstance(self.extractor_versions, dict):
+            # Freeze/copy dict
+            object.__setattr__(self, "extractor_versions", dict(self.extractor_versions))
 
 
 @dataclass(frozen=True)

@@ -101,12 +101,12 @@ class ThresholdPolicy:
         ):
             raise ContractValidationError(f"Threshold dBFS invariant violated: t_on_dbfs ({self.t_on_dbfs}) must be > t_off_dbfs ({self.t_off_dbfs})")
         exp_on_dbfs = 10.0 * math.log10(max(float(self.t_on_linear), 1e-15))
-        if not math.isclose(float(self.t_on_dbfs), exp_on_dbfs, abs_tol=1.0):
+        if not math.isclose(float(self.t_on_dbfs), exp_on_dbfs, abs_tol=0.5):
             raise ContractValidationError(
                 f"Contradictory linear/dBFS threshold: t_on_linear={self.t_on_linear} implies ~{exp_on_dbfs:.2f} dBFS, but t_on_dbfs={self.t_on_dbfs}"
             )
         exp_off_dbfs = 10.0 * math.log10(max(float(self.t_off_linear), 1e-15))
-        if not math.isclose(float(self.t_off_dbfs), exp_off_dbfs, abs_tol=1.0):
+        if not math.isclose(float(self.t_off_dbfs), exp_off_dbfs, abs_tol=0.5):
             raise ContractValidationError(
                 f"Contradictory linear/dBFS threshold: t_off_linear={self.t_off_linear} implies ~{exp_off_dbfs:.2f} dBFS, but t_off_dbfs={self.t_off_dbfs}"
             )
@@ -124,8 +124,8 @@ class ThresholdPolicy:
                 raise ContractValidationError("monitored_band_hz must have exactly 2 elements (f_low, f_high)")
             f_low, f_high = self.monitored_band_hz
             nyq = float(self.sample_rate_hz) / 2.0
-            if not (0.0 <= f_low < f_high <= nyq):
-                raise ContractValidationError(f"monitored_band_hz ({f_low}, {f_high}) outside valid Nyquist interval [0, {nyq}]")
+            if not (-nyq <= f_low < f_high <= nyq):
+                raise ContractValidationError(f"monitored_band_hz ({f_low}, {f_high}) outside valid Nyquist interval [-{nyq}, {nyq}]")
         if isinstance(self.training_samples, bool) or not isinstance(self.training_samples, (int, np.integer)) or self.training_samples < 0:
             raise ContractValidationError(f"training_samples must be an integer >= 0, got {self.training_samples!r}")
         if isinstance(self.training_windows, bool) or not isinstance(self.training_windows, (int, np.integer)) or self.training_windows < 0:
@@ -206,13 +206,13 @@ class GaussianNoiseEstimator(NoiseEstimatorProtocol, Resettable):
         self._warmup_powers: list[tuple[float, int]] = []
         self._warmup_samples_collected: int = 0
         self._frozen: bool = False
+        self._suspended: bool = False
 
         if self._initial_noise_power is not None:
             self._state = NoiseLifecycleState.VALID
         elif self._target_warmup_samples > 0:
             self._state = NoiseLifecycleState.CALIBRATING
         else:
-            self._state = NoiseLifecycleState.UNCALIBRATED
             self._state = NoiseLifecycleState.UNCALIBRATED
 
     @property
@@ -326,7 +326,7 @@ class GaussianNoiseEstimator(NoiseEstimatorProtocol, Resettable):
         Returns:
             The number of samples consumed from samples_iq.
         """
-        if self._frozen or len(samples_iq) == 0:
+        if self._frozen or getattr(self, "_suspended", False) or len(samples_iq) == 0:
             return 0
         if self._state != NoiseLifecycleState.CALIBRATING:
             return 0
@@ -354,9 +354,13 @@ class GaussianNoiseEstimator(NoiseEstimatorProtocol, Resettable):
                     self._state = NoiseLifecycleState.VALID
         return n_consume
 
+    def suspend_training(self) -> None:
+        """Suspend warmup noise ingestion until explicit authorized recalibration."""
+        self._suspended = True
+
     def update(self, block: IQBlock) -> NoiseEstimate:
         """Update noise estimator with an incoming IQ block."""
-        if not self._frozen and block.num_samples > 0:
+        if not self._frozen and not getattr(self, "_suspended", False) and block.num_samples > 0:
             self.update_samples(block.iq)
         return self.get_estimate(block.stream.stream_id, block.sequence_number)
 
@@ -374,6 +378,7 @@ class GaussianNoiseEstimator(NoiseEstimatorProtocol, Resettable):
         self._warmup_powers.clear()
         self._warmup_samples_collected = 0
         self._frozen = False
+        self._suspended = False
         self._state = NoiseLifecycleState.CALIBRATING
 
     def reset(self) -> None:
@@ -382,6 +387,7 @@ class GaussianNoiseEstimator(NoiseEstimatorProtocol, Resettable):
         self._warmup_powers.clear()
         self._warmup_samples_collected = 0
         self._frozen = False
+        self._suspended = False
         if self._initial_noise_power is not None:
             self._state = NoiseLifecycleState.VALID
         elif self._target_warmup_samples > 0:
@@ -512,7 +518,7 @@ class AdaptiveRobustNoiseEstimator(NoiseEstimatorProtocol, Resettable):
     @property
     def staleness_samples(self) -> int:
         """Samples elapsed since the last accepted noise update."""
-        return self._samples_since_last_accepted
+        return self._samples_since_last_accepted + len(self._adaptation_residual)
 
     @property
     def _accepted_noise_samples(self) -> int:
@@ -538,7 +544,7 @@ class AdaptiveRobustNoiseEstimator(NoiseEstimatorProtocol, Resettable):
         if isinstance(num_samples, bool) or not isinstance(num_samples, (int, np.integer)) or num_samples < 0:
             raise ValueError(f"num_samples must be an integer >= 0, got {num_samples!r}")
         self._samples_since_last_accepted += int(num_samples)
-        if self._samples_since_last_accepted > self._max_staleness_samples and (
+        if self.staleness_samples > self._max_staleness_samples and (
             self._state == NoiseLifecycleState.VALID
             or (self._state == NoiseLifecycleState.UNCALIBRATED and self._noise_power_linear is not None)
         ):
@@ -600,6 +606,11 @@ class AdaptiveRobustNoiseEstimator(NoiseEstimatorProtocol, Resettable):
         n_chunks = len(combined) // m
         if n_chunks == 0:
             self._adaptation_residual = combined.copy()
+            if self.staleness_samples > self._max_staleness_samples and (
+                self._state == NoiseLifecycleState.VALID
+                or (self._state == NoiseLifecycleState.UNCALIBRATED and self._noise_power_linear is not None)
+            ):
+                self._state = NoiseLifecycleState.STALE
             return
 
         dt = m / self._sample_rate_hz
@@ -610,9 +621,10 @@ class AdaptiveRobustNoiseEstimator(NoiseEstimatorProtocol, Resettable):
             c128 = chunk.astype(np.complex128)
             mag_sq = np.real(c128) ** 2 + np.imag(c128) ** 2
             med_p = float(np.median(mag_sq))
-            sigma2_est = med_p / math.log(2.0)
+            mean_p = float(np.mean(mag_sq))
+            sigma2_est = min(med_p / math.log(2.0), mean_p)
             if sigma2_est <= 0.0 or not math.isfinite(sigma2_est):
-                self.advance_stream_samples(m)
+                self._samples_since_last_accepted += m
                 continue
 
             if self._noise_power_linear is None:
@@ -632,9 +644,11 @@ class AdaptiveRobustNoiseEstimator(NoiseEstimatorProtocol, Resettable):
 
         rem_start = n_chunks * m
         self._adaptation_residual = combined[rem_start:].copy()
-
-        rem = combined[n_chunks * m :]
-        self._adaptation_residual = rem.copy() if len(rem) > 0 else np.empty(0, dtype=np.complex64)
+        if self.staleness_samples > self._max_staleness_samples and (
+            self._state == NoiseLifecycleState.VALID
+            or (self._state == NoiseLifecycleState.UNCALIBRATED and self._noise_power_linear is not None)
+        ):
+            self._state = NoiseLifecycleState.STALE
 
     def update(self, block: IQBlock) -> NoiseEstimate:
         if not self._frozen and block.num_samples > 0:
@@ -723,14 +737,15 @@ class EmpiricalNoiseCalibrator:
         if monitored_band_hz is not None:
             f_min, f_max = float(monitored_band_hz[0]), float(monitored_band_hz[1])
             nyquist = float(sample_rate_hz) / 2.0
-            if not (0.0 <= f_min < f_max <= nyquist):
-                raise ValueError(f"monitored_band_hz ({f_min}, {f_max}) outside valid Nyquist interval [0, {nyquist}]")
+            if not (-nyquist <= f_min < f_max <= nyquist):
+                raise ValueError(f"monitored_band_hz ({f_min}, {f_max}) outside valid Nyquist interval [-{nyquist}, {nyquist}]")
 
         self._cal_sample_rate_hz = float(sample_rate_hz)
         self._cal_settling_remaining = int(settling_samples)
         self._cal_settling_total = int(settling_samples)
         self._cal_monitored_band_hz = tuple(monitored_band_hz) if monitored_band_hz is not None else None
         self._cal_filter_order = int(filter_order)
+        self._finalized = False
 
         self._cal_sos = None
         self._cal_sos_zi = None
@@ -756,10 +771,12 @@ class EmpiricalNoiseCalibrator:
 
     def update_calibration(self, chunk: np.ndarray) -> None:
         """Ingest a chunk of training noise samples in a bounded streaming manner."""
+        if getattr(self, "_finalized", False):
+            raise RuntimeError("Calibration has been finalized")
+        if not isinstance(chunk, np.ndarray) or chunk.ndim != 1:
+            raise ValueError(f"Calibration input must be a 1D numpy array, got {getattr(chunk, 'shape', type(chunk))}")
         if not np.iscomplexobj(chunk):
             raise ValueError(f"Calibration input must be complex dtype, got {chunk.dtype}")
-        if not np.all(np.isfinite(chunk)):
-            raise ValueError("Calibration input contains NaN or Inf values")
 
         if len(chunk) == 0:
             return
@@ -767,12 +784,15 @@ class EmpiricalNoiseCalibrator:
         if self._cal_samples_collected >= self.max_samples:
             return
 
-        # Pre-cap incoming samples by remaining settling + training budget BEFORE filtering
+        # Pre-cap incoming samples by remaining settling + training budget BEFORE filtering/validation
         remaining_needed = self._cal_settling_remaining + (self.max_samples - self._cal_samples_collected)
         if remaining_needed <= 0:
             return
         if len(chunk) > remaining_needed:
             chunk = chunk[:remaining_needed]
+
+        if not np.all(np.isfinite(chunk)):
+            raise ValueError("Calibration input contains NaN or Inf values")
 
         if self._cal_sos is not None:
             n = len(chunk)
@@ -837,6 +857,7 @@ class EmpiricalNoiseCalibrator:
 
     def finalize_calibration(self) -> dict[str, Any]:
         """Finalize calibration and return result dictionary with full parameter identity."""
+        self._finalized = True
         if self._cal_samples_collected < self.window_size:
             raise ValueError(
                 f"Insufficient valid calibration samples ({self._cal_samples_collected}) for window size {self.window_size}"
@@ -853,7 +874,7 @@ class EmpiricalNoiseCalibrator:
         required_windows_on = int(math.ceil(1.0 / self.pfa_on))
         required_windows_off = int(math.ceil(1.0 / self.pfa_off))
         independent_windows = self._cal_samples_collected // self.window_size
-        supported_pfa = (n_windows >= required_windows_on) and (independent_windows >= required_windows_on)
+        supported_pfa = (n_windows > required_windows_on) and (independent_windows > required_windows_on)
 
         if supported_pfa and n_windows > 0:
             emp_t_on = float(np.quantile(win_powers, 1.0 - self.pfa_on))
@@ -932,7 +953,7 @@ class EmpiricalNoiseCalibrator:
         """Create a validated typed ThresholdPolicy from training noise or calibration dict."""
         if isinstance(noise_or_cal, dict):
             cal = noise_or_cal
-            required_keys = ("window_size", "hop_size", "pfa_on", "pfa_off")
+            required_keys = ("window_size", "hop_size", "pfa_on", "pfa_off", "sample_rate_hz")
             for k in required_keys:
                 if k not in cal:
                     raise PolicyCompatibilityError(f"Calibration dictionary lacks required parameter identity: {k}")
@@ -951,6 +972,10 @@ class EmpiricalNoiseCalibrator:
             if not math.isclose(cal["pfa_off"], self.pfa_off, rel_tol=1e-7):
                 raise PolicyCompatibilityError(
                     f"Pfa_off mismatch: calibration dict pfa_off ({cal['pfa_off']}) does not match calibrator ({self.pfa_off})"
+                )
+            if not math.isclose(cal["sample_rate_hz"], sample_rate_hz, rel_tol=1e-7):
+                raise PolicyCompatibilityError(
+                    f"Sample rate mismatch: calibration dict sample_rate_hz ({cal['sample_rate_hz']}) does not match requested ({sample_rate_hz})"
                 )
         else:
             cal = self.calibrate(

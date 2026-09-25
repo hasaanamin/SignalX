@@ -26,7 +26,7 @@ class CircularIQBuffer:
     """
 
     def __init__(self, capacity: int) -> None:
-        if not isinstance(capacity, (int, np.integer)) or capacity < 1:
+        if isinstance(capacity, bool) or not isinstance(capacity, (int, np.integer)) or capacity < 1:
             raise ValueError(f"Circular buffer capacity must be an integer >= 1, got {capacity!r}")
         self._capacity = int(capacity)
         self._buffer = np.zeros(self._capacity, dtype=np.complex64)
@@ -90,11 +90,15 @@ class CircularIQBuffer:
                 in an ongoing continuous generation.
             ValueError: If iq is malformed or not complex64.
         """
+        if isinstance(start_sample, bool) or not isinstance(start_sample, (int, np.integer)) or int(start_sample) < 0:
+            raise ValueError(f"start_sample must be an integer >= 0, got {start_sample!r}")
         arr = np.asarray(iq)
         if arr.dtype != np.complex64 or arr.ndim != 1:
             raise ValueError(
                 f"IQ data must be a 1D np.complex64 array, got shape {arr.shape} dtype {arr.dtype}"
             )
+        if not np.all(np.isfinite(arr)):
+            raise ValueError("IQ data must contain only finite values (no NaN or Inf)")
         n = len(arr)
         if n == 0:
             return

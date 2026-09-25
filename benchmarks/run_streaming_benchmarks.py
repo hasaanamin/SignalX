@@ -357,7 +357,7 @@ def run_paced_stress_benchmark(duration_seconds: float = 2.0) -> dict:
     max_backlog_ms = 0.0
 
     while (block := source.read_block()) is not None:
-        target_delivery_time = t_start + blocks_processed * block_duration_s
+        target_delivery_time = t_start + (blocks_processed + 1) * block_duration_s
         now = time.perf_counter()
         if now < target_delivery_time:
             # Pace producer to match physical arrival rate
@@ -397,6 +397,7 @@ def run_paced_stress_benchmark(duration_seconds: float = 2.0) -> dict:
         "max_backlog_ms": max_backlog_ms,
         "emitted_events": emitted_count,
         "overload_drops": overload_drops,
+        "passed": real_time_passed,
     }
 
 
@@ -404,14 +405,19 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Streaming RF Signal Analysis Benchmarks")
     parser.add_argument("--stress-duration", type=float, default=2.0, help="Duration in seconds for paced stress run")
     parser.add_argument("--trials", type=int, default=30, help="Number of trials per SNR level")
+    parser.add_argument("--enforce-acceptance", action="store_true", help="Exit with code 1 if real-time acceptance criteria are not met")
     args = parser.parse_args()
 
     evaluate_detection_performance(num_trials_per_snr=args.trials)
     run_latency_and_throughput_benchmarks()
-    run_paced_stress_benchmark(duration_seconds=args.stress_duration)
+    stress_results = run_paced_stress_benchmark(duration_seconds=args.stress_duration)
     print("\n" + "=" * 80)
     print("ALL EVALUATIONS AND BENCHMARKS COMPLETED")
     print("=" * 80)
+
+    if args.enforce_acceptance and not stress_results.get("passed", False):
+        print("FAIL: Enforce acceptance failed (real-time deadlines missed or queue drops occurred)")
+        sys.exit(1)
 
 
 if __name__ == "__main__":

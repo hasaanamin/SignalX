@@ -263,16 +263,21 @@ class BandwidthFeatureExtractor:
         if mode == "emitter" and check_edge_clipping:
             # 1. If ROI is configured within wider observation, check if > 1% excess energy lies outside ROI
             if roi_hz is not None:
-                p_excess_all = np.maximum(p - noise_linear, 0.0)
-                total_excess = float(np.sum(p_excess_all))
-                roi_excess = float(np.sum(p_excess_all[roi_mask]))
-                outside_excess = total_excess - roi_excess
-                if total_excess > 0.0 and (outside_excess / total_excess) > 0.01:
+                f_min, f_max = float(roi_hz[0]), float(roi_hz[1])
+                if f[0] >= f_min or f[-1] <= f_max:
                     obw_tail_clipped = True
-                    frac_out = (outside_excess / total_excess) * 100.0
-                    obw_clip_reason = f"Emitter 99% energy tails not contained in ROI ({frac_out:.1f}% excess energy outside ROI)"
+                    obw_clip_reason = "Cannot certify physical emitter 99% containment: observation is truncated at frequency boundary with no wider ROI"
                 else:
-                    obw_tail_clipped = False
+                    p_excess_all = np.maximum(p - noise_linear, 0.0)
+                    total_excess = float(np.sum(p_excess_all))
+                    roi_excess = float(np.sum(p_excess_all[roi_mask]))
+                    outside_excess = total_excess - roi_excess
+                    if total_excess > 0.0 and (outside_excess / total_excess) > 0.01:
+                        obw_tail_clipped = True
+                        frac_out = (outside_excess / total_excess) * 100.0
+                        obw_clip_reason = f"Emitter 99% energy tails not contained in ROI ({frac_out:.1f}% excess energy outside ROI)"
+                    else:
+                        obw_tail_clipped = False
             else:
                 # 2. Observation boundary edge: when roi_hz is None, the observation is truncated at the frequency
                 # boundaries without a wider observation window to certify physical emitter 99% containment

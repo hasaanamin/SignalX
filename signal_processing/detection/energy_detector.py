@@ -184,6 +184,27 @@ class EnergyDetector(DetectorProtocol, Resettable):
         import hashlib
         self._sos_hash = hashlib.sha256(self._sos.tobytes()).hexdigest()[:12]
 
+        # Compute effective degrees of freedom N_eff using Welch-Satterthwaite relation on filter autocorrelation
+        # Under circular complex Gaussian noise, sample powers are correlated with covariance |r_hh[k]|^2
+        imp_len = min(4096, max(512, self._window_size * 8))
+        imp = np.zeros(imp_len, dtype=np.float64)
+        imp[0] = 1.0
+        h = signal.sosfilt(self._sos, imp)
+        r_hh = np.correlate(h, h, mode="full")
+        mid = len(r_hh) // 2
+        N = self._window_size
+        k = np.arange(-(N - 1), N)
+        r_k = r_hh[mid - (N - 1) : mid + N]
+        weights = N - np.abs(k)
+        var_sum = float(np.sum(weights * np.abs(r_k) ** 2))
+        r0_sq = float(r_hh[mid] ** 2)
+        if var_sum > 0.0 and r0_sq > 0.0:
+            self._n_eff = float((N ** 2 * r0_sq) / var_sum)
+        else:
+            self._n_eff = float(N)
+        self._unit_q_on = float(gamma.isf(self._pfa_on, a=self._n_eff, scale=1.0 / self._n_eff))
+        self._unit_q_off = float(gamma.isf(self._pfa_off, a=self._n_eff, scale=1.0 / self._n_eff))
+
     @property
     def window_size(self) -> int:
         return self._window_size
@@ -232,11 +253,11 @@ class EnergyDetector(DetectorProtocol, Resettable):
 
         if self._threshold_policy is not None and self._threshold_policy.mode == "empirical_matched":
             p_ref = self._threshold_policy.mean_power_linear
-            scale_ratio = p_noise_lin / p_ref if p_ref > 0 else 1.0
-            if abs(math.log10(scale_ratio)) > 0.5:
+            if not math.isclose(p_noise_lin, p_ref, rel_tol=0.05):
                 raise PolicyCompatibilityError(
                     f"Noise reference power ({p_noise_lin}) is incompatible with empirical policy reference ({p_ref})"
                 )
+            scale_ratio = p_noise_lin / p_ref if p_ref > 0 else 1.0
             t_on_lin = self._threshold_policy.t_on_linear * scale_ratio
             t_off_lin = self._threshold_policy.t_off_linear * scale_ratio
             t_on_dbfs = 10.0 * math.log10(max(t_on_lin, self._conversion_floor))
@@ -247,9 +268,10 @@ class EnergyDetector(DetectorProtocol, Resettable):
                 t_on_lin = float(p_noise_lin * self._unit_q_on)
                 t_off_lin = float(p_noise_lin * self._unit_q_off)
             else:
-                scale = max(p_noise_lin, self._conversion_floor) / n
-                t_on_lin = float(gamma.isf(self._pfa_on, a=n, scale=scale))
-                t_off_lin = float(gamma.isf(self._pfa_off, a=n, scale=scale))
+                a_param = getattr(self, "_n_eff", n) if self._mode == "configured_band" else n
+                scale = max(p_noise_lin, self._conversion_floor) / a_param
+                t_on_lin = float(gamma.isf(self._pfa_on, a=a_param, scale=scale))
+                t_off_lin = float(gamma.isf(self._pfa_off, a=a_param, scale=scale))
             t_on_dbfs = 10.0 * math.log10(max(t_on_lin, self._conversion_floor))
             t_off_dbfs = 10.0 * math.log10(max(t_off_lin, self._conversion_floor))
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import collections
+import dataclasses
 import enum
 import queue
 import threading
@@ -166,9 +167,13 @@ class FeatureAnalysisWorker:
         with self._lock:
             self._result_sinks.append(sink)
 
-    def _deliver_sink(self, result: CaptureSidecar) -> None:
+    def _deliver_sink(self, result: CaptureSidecar, *args: Any, **kwargs: Any) -> None:
         """Invoke external result sink callback strictly outside lifecycle locks."""
+        generation = args[0] if args else getattr(result, "_generation", getattr(result, "stream_epoch", None))
         with self._lock:
+            if generation is not None and generation < self._current_generation:
+                self._discarded_old_generation_count += 1
+                return
             sinks_snapshot = list(self._result_sinks)
 
         for sink in sinks_snapshot:
@@ -197,7 +202,30 @@ class FeatureAnalysisWorker:
                 return sidecar.with_features(features=None, feature_status="skipped_quality", feature_reason=reason)
 
         try:
-            context = SignalContext(event=sidecar.event, config=self._analysis_config)
+            from signal_processing.core.contracts import CaptureQuality
+
+            if not sidecar.event.complete:
+                if sidecar.termination_reason == "eof":
+                    warns = ("Incomplete event capture: terminated at EOF",)
+                elif sidecar.unknown_loss:
+                    warns = ("Incomplete event capture: terminated by unknown loss / overflow",)
+                elif sidecar.known_lost_samples > 0:
+                    warns = (
+                        f"Incomplete event capture: terminated by discontinuity with {sidecar.known_lost_samples} known lost samples",
+                    )
+                else:
+                    warns = (f"Incomplete event capture: {sidecar.termination_reason}",)
+            else:
+                warns = ()
+            cap_quality = CaptureQuality(
+                complete=sidecar.event.complete,
+                dropped_samples=sidecar.event.dropped_samples,
+                is_continuous=sidecar.event.dropped_samples == 0,
+                warnings=warns,
+            )
+            context = SignalContext(
+                event=sidecar.event, config=self._analysis_config, capture_quality=cap_quality
+            )
             analysis_result: AnalysisResult = self._aggregator.extract_analysis_result(context)
             if not sidecar.event.complete:
                 status = "degraded"
@@ -239,6 +267,7 @@ class FeatureAnalysisWorker:
 
             if self._synchronous:
                 result = self._process_one(sidecar)
+                result = dataclasses.replace(result, stream_epoch=gen)
                 if self._record_result_locked(result, gen):
                     to_deliver = result
                 result_to_return = result
@@ -253,6 +282,7 @@ class FeatureAnalysisWorker:
                         feature_status="dropped_overload",
                         feature_reason="Feature worker queue full",
                     )
+                    dropped_result = dataclasses.replace(dropped_result, stream_epoch=gen)
                     if self._record_result_locked(dropped_result, gen):
                         to_deliver = dropped_result
                     result_to_return = dropped_result
@@ -274,8 +304,11 @@ class FeatureAnalysisWorker:
                 continue
 
             to_deliver: CaptureSidecar | None = None
+            gen: int | None = None
             try:
                 if item is _SENTINEL:
+                    with self._lock:
+                        self._sentinel_enqueued = False
                     break
 
                 gen, sidecar = item
@@ -285,6 +318,7 @@ class FeatureAnalysisWorker:
                         continue
 
                 result = self._process_one(sidecar)
+                result = dataclasses.replace(result, stream_epoch=gen)
                 with self._lock:
                     if self._record_result_locked(result, gen):
                         to_deliver = result
@@ -303,6 +337,8 @@ class FeatureAnalysisWorker:
                     item = self._queue.get_nowait()
                     if item is not _SENTINEL:
                         cancelled += 1
+                    else:
+                        self._sentinel_enqueued = False
                     self._queue.task_done()
                 except queue.Empty:
                     break
