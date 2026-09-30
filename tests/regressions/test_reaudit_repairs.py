@@ -248,10 +248,13 @@ class TestSection2ConfiguredBandThresholds:
             monitored_band_hz=band,
         )
 
-        assert cal_res["supported_pfa"] is True
+        # Resolution permits estimation, not certification from training alone.
+        assert cal_res["quantile_resolved"] is True
+        assert cal_res["supported_pfa"] is False
         policy = calibrator.create_policy(cal_res)
         assert isinstance(policy, ThresholdPolicy)
-        assert policy.supported_pfa is True
+        assert policy.valid is True
+        assert policy.supported_pfa is False
 
         # Run test noise through detector with empirical policy
         detector = EnergyDetector(

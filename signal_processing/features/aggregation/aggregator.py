@@ -168,23 +168,15 @@ class FeatureAggregator:
             elif getattr(ext, "name", None) == "amplitude":
                 amp_ext = ext
 
-        if bw_ext is not None and getattr(bw_ext, "config", None) is not None:
-            bw_cfg = bw_ext.config
-            resolved_bw_mode = str(bw_cfg.mode)
-            resolved_bw_interp = bool(bw_cfg.interpolate_edges)
-            resolved_bw_prom = float(bw_cfg.dominant_lobe_min_prominence_db)
-            resolved_bw_roi = list(bw_cfg.roi_hz) if bw_cfg.roi_hz is not None else None
-            resolved_bw_noise_floor = bw_cfg.noise_floor_dbfs_per_hz
-            resolved_bw_min_snr = float(bw_cfg.min_snr_db) if getattr(bw_cfg, "min_snr_db", None) is not None else None
-            resolved_check_edge_clipping = bool(getattr(bw_cfg, "check_edge_clipping", True))
-        else:
-            resolved_bw_mode = str(getattr(cfg, "bandwidth_mode", "raw_psd"))
-            resolved_bw_interp = bool(getattr(cfg, "bandwidth_interpolate_edges", False))
-            resolved_bw_prom = float(getattr(cfg, "bandwidth_dominant_lobe_min_prominence_db", 3.0))
-            resolved_bw_roi = list(cfg.bandwidth_roi_hz) if getattr(cfg, "bandwidth_roi_hz", None) is not None else None
-            resolved_bw_noise_floor = getattr(cfg, "bandwidth_noise_floor_dbfs_per_hz", None)
-            resolved_bw_min_snr = getattr(cfg, "bandwidth_min_snr_db", None)
-            resolved_check_edge_clipping = bool(getattr(cfg, "bandwidth_check_edge_clipping", True))
+        from signal_processing.features.bandwidth import BandwidthFeatureExtractor
+        bw_cfg = (bw_ext or BandwidthFeatureExtractor()).resolve_config(context)
+        resolved_bw_mode = bw_cfg.mode
+        resolved_bw_interp = bw_cfg.interpolate_edges
+        resolved_bw_prom = bw_cfg.dominant_lobe_min_prominence_db
+        resolved_bw_roi = list(bw_cfg.roi_hz) if bw_cfg.roi_hz is not None else None
+        resolved_bw_noise_floor = bw_cfg.noise_floor_dbfs_per_hz
+        resolved_bw_min_snr = bw_cfg.min_snr_db
+        resolved_check_edge_clipping = bw_cfg.check_edge_clipping
 
         resolved_amplitude_ddof = (
             getattr(amp_ext, "_config", None).ddof
@@ -215,6 +207,11 @@ class FeatureAggregator:
             "bandwidth_noise_floor_dbfs_per_hz": resolved_bw_noise_floor,
             "bandwidth_min_snr_db": resolved_bw_min_snr,
             "check_edge_clipping": resolved_check_edge_clipping,
+            "bandwidth_auto_noise_estimation": bw_cfg.auto_noise_estimation,
+            "bandwidth_multimodal_ratio_threshold": bw_cfg.multimodal_ratio_threshold,
+            "bandwidth_occupied_power_scope": bw_cfg.occupied_power_scope,
+            "bandwidth_complete_observation": bw_cfg.complete_observation,
+            "bandwidth_support_provenance": bw_cfg.support_provenance,
             "extractor_versions": {ext.name: ext.version for ext in self._registry.extractors},
             "feature_names": sorted(vector.features.keys()),
         }
@@ -222,33 +219,7 @@ class FeatureAggregator:
         policy_hash = hashlib.sha256(cfg_json.encode("utf-8")).hexdigest()[:12]
         policy_id = f"policy_{self._feature_schema_version}_{policy_hash}"
 
-        policy = ExtractionPolicy(
-            policy_id=policy_id,
-            schema_version=self._feature_schema_version,
-            sample_rate_hz=float(sample_rate_hz),
-            observation_samples=int(obs_samples),
-            psd_mode=psd_mode,
-            nfft=resolved_nfft,
-            spectral_window=resolved_window,
-            psd_nperseg=resolved_nperseg,
-            psd_noverlap=resolved_noverlap,
-            autocorrelation_max_lag_samples=resolved_max_lag,
-            autocorrelation_normalized=resolved_autocorr_norm,
-            phase_amplitude_threshold=resolved_phase_thresh,
-            bandwidth_roi_hz=tuple(resolved_bw_roi) if resolved_bw_roi is not None else None,
-            bandwidth_noise_floor_dbfs_per_hz=resolved_bw_noise_floor,
-            feature_names=tuple(vector.features.keys()),
-            centered_spectrum=resolved_centered,
-            bandwidth_mode=resolved_bw_mode,
-            bandwidth_interpolate_edges=resolved_bw_interp,
-            bandwidth_dominant_lobe_min_prominence_db=resolved_bw_prom,
-            power_floor_dbfs=resolved_p_floor,
-            psd_floor_dbfs_per_hz=resolved_psd_floor,
-            bandwidth_min_snr_db=resolved_bw_min_snr,
-            amplitude_ddof=int(resolved_amplitude_ddof),
-            check_edge_clipping=resolved_check_edge_clipping,
-            extractor_versions={ext.name: ext.version for ext in self._registry.extractors},
-        )
+        policy = ExtractionPolicy(policy_id=policy_id, **canonical_dict)
 
         return AnalysisResult(
             feature_vector=vector,

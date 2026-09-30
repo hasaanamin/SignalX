@@ -9,7 +9,7 @@ import numpy as np
 from scipy import signal
 from scipy.stats import gamma
 
-from signal_processing.core.contracts import DetectionMeasurement, IQBlock, NoiseEstimate
+from signal_processing.core.contracts import DetectionMeasurement, IQBlock, NoiseEstimate, NoiseReferenceDomain
 from signal_processing.core.interfaces import DetectorProtocol, Resettable
 from signal_processing.detection.exceptions import (
     FilterConfigurationError,
@@ -42,6 +42,8 @@ class EnergyDetector(DetectorProtocol, Resettable):
         filter_order: int = 4,
         conversion_floor_linear: float = 1e-15,
         threshold_policy: ThresholdPolicy | None = None,
+        gain_id: str = "digital_iq_unity",
+        require_supported_pfa: bool = False,
     ) -> None:
         if isinstance(window_size, bool) or not isinstance(window_size, (int, np.integer)) or window_size < 1:
             raise ValueError(f"window_size must be >= 1, got {window_size!r}")
@@ -95,6 +97,10 @@ class EnergyDetector(DetectorProtocol, Resettable):
         if self._mode == "configured_band":
             self._init_configured_band_filter(filter_order)
 
+        self.reference_domain = NoiseReferenceDomain(
+            self._sample_rate_hz, self._monitored_band_hz, self._sos_hash, gain_id
+        )
+        self._require_supported_pfa = require_supported_pfa
         self._threshold_policy: ThresholdPolicy | None = None
         if threshold_policy is not None:
             self.set_threshold_policy(threshold_policy)
@@ -105,7 +111,7 @@ class EnergyDetector(DetectorProtocol, Resettable):
             raise TypeError(f"policy must be a ThresholdPolicy instance, got {type(policy).__name__}")
         if not policy.valid:
             raise PolicyCompatibilityError(f"Threshold policy is marked invalid: {policy.reason}")
-        if not policy.supported_pfa:
+        if self._require_supported_pfa and not policy.supported_pfa:
             raise PolicyCompatibilityError(f"Threshold policy has unsupported Pfa: {policy.reason}")
         if policy.window_size != self._window_size:
             raise PolicyCompatibilityError(
@@ -137,6 +143,8 @@ class EnergyDetector(DetectorProtocol, Resettable):
                 raise PolicyCompatibilityError(
                     "Cannot attach a configured-band policy to a full-band detector"
                 )
+        if policy.reference_domain is not None and policy.reference_domain != self.reference_domain:
+            raise PolicyCompatibilityError("Policy reference domain differs from detector path/gain")
         self._threshold_policy = policy
 
     @property
@@ -184,26 +192,80 @@ class EnergyDetector(DetectorProtocol, Resettable):
         import hashlib
         self._sos_hash = hashlib.sha256(self._sos.tobytes()).hexdigest()[:12]
 
-        # Compute effective degrees of freedom N_eff using Welch-Satterthwaite relation on filter autocorrelation
-        # Under circular complex Gaussian noise, sample powers are correlated with covariance |r_hh[k]|^2
-        imp_len = min(4096, max(512, self._window_size * 8))
-        imp = np.zeros(imp_len, dtype=np.float64)
-        imp[0] = 1.0
-        h = signal.sosfilt(self._sos, imp)
-        r_hh = np.correlate(h, h, mode="full")
-        mid = len(r_hh) // 2
-        N = self._window_size
-        k = np.arange(-(N - 1), N)
-        r_k = r_hh[mid - (N - 1) : mid + N]
-        weights = N - np.abs(k)
-        var_sum = float(np.sum(weights * np.abs(r_k) ** 2))
-        r0_sq = float(r_hh[mid] ** 2)
-        if var_sum > 0.0 and r0_sq > 0.0:
-            self._n_eff = float((N ** 2 * r0_sq) / var_sum)
+        # Pole decay determines a converged impulse horizon, rather than N or
+        # an arbitrary short cap. Extremely narrow filters use the universal
+        # Gaussian correlation bound (sum eigenweights^2 <= 1), explicitly.
+        poles = np.concatenate([np.roots(section[3:]) for section in self._sos])
+        radius = float(np.max(np.abs(poles)))
+        if not 0 < radius < 1:
+            raise FilterConfigurationError("Filter must have stable poles")
+        length = max(512, int(math.ceil(math.log(1e-15) / math.log(radius))))
+        self._worst_case_correlation = length > 262144
+        self._impulse_length = 0
+        self._impulse_tail_fraction = None
+        if self._worst_case_correlation:
+            self._covariance_method = "worst_case_gaussian_correlation_bound"
+            self._filter_autocorrelation = np.ones(self._window_size)
         else:
-            self._n_eff = float(N)
-        self._unit_q_on = float(gamma.isf(self._pfa_on, a=self._n_eff, scale=1.0 / self._n_eff))
-        self._unit_q_off = float(gamma.isf(self._pfa_off, a=self._n_eff, scale=1.0 / self._n_eff))
+            impulse = np.zeros(length)
+            impulse[0] = 1.0
+            response = signal.sosfilt(self._sos, impulse)
+            tail_fraction = float(np.sum(response[-max(32, length // 8):] ** 2) / np.sum(response ** 2))
+            if tail_fraction > 1e-12:
+                raise FilterConfigurationError("Filter impulse response did not converge")
+            autocorr = signal.fftconvolve(response, response[::-1], mode="full")[length - 1:]
+            self._filter_autocorrelation = autocorr / autocorr[0]
+            self._impulse_length = length
+            self._impulse_tail_fraction = tail_fraction
+            self._covariance_method = "converged_impulse_autocorrelation"
+        self._n_eff = self._effective_n(self._window_size)
+        self._unit_q_on, self._unit_q_off = self._configured_quantiles(self._window_size)
+
+    def _ensure_covariance_lags(self, n: int) -> None:
+        if len(self._filter_autocorrelation) < n:
+            self._filter_autocorrelation = np.pad(
+                self._filter_autocorrelation, (0, n - len(self._filter_autocorrelation)),
+                constant_values=1.0 if self._worst_case_correlation else 0.0,
+            )
+
+    def _effective_n(self, n: int) -> float:
+        self._ensure_covariance_lags(n)
+        r = self._filter_autocorrelation[:n]
+        lags = np.arange(1, len(r))
+        variance = (n + 2 * np.sum((n - lags) * r[1:] ** 2)) / n ** 2
+        return 1.0 / float(variance)
+
+    def _configured_quantiles(self, n: int) -> tuple[float, float]:
+        """Conservative Gaussian quadratic-form bound, not an effective-Gamma tail.
+
+        For X=sum(w_i Exp(1)), sum(w_i)=1:
+        P[X >= 1+sqrt(2 sum(w_i^2) t)+max(w_i)t] <= exp(-t).
+        The Toeplitz absolute row-sum bounds max(w_i). Impulse convergence
+        is checked, or worst-case correlation used; this is conditional on stationary white
+        circular-Gaussian input and a correct mean, not receiver certification.
+        """
+        if n == 1:
+            return -math.log(self._pfa_on), -math.log(self._pfa_off)
+        self._ensure_covariance_lags(n)
+        r = self._filter_autocorrelation[:n]
+        variance = 1.0 / self._effective_n(n)
+        radius_bound = min(1.0, float(1 + 2 * np.sum(np.abs(r[1:]))) / n)
+        def bound(p: float) -> float:
+            t = -math.log(p)
+            return 1.0 + math.sqrt(2 * variance * t) + radius_bound * t
+        return bound(self._pfa_on), bound(self._pfa_off)
+
+    @property
+    def threshold_model(self) -> str:
+        if self._threshold_policy is not None:
+            return self._threshold_policy.mode
+        return "stationary_gaussian_quadratic_bound" if self._mode == "configured_band" else "iid_complex_gaussian_gamma"
+
+    def _validate_input(self, block: IQBlock) -> None:
+        if not math.isclose(block.stream.sample_rate_hz, self._sample_rate_hz, rel_tol=1e-12):
+            raise PolicyCompatibilityError("Input sample rate differs from detector sample rate")
+        if not np.all(np.isfinite(block.iq)):
+            raise ValueError("Input IQ must contain only finite samples")
 
     @property
     def window_size(self) -> int:
@@ -245,6 +307,8 @@ class EnergyDetector(DetectorProtocol, Resettable):
             )
 
         p_noise_dbfs = float(noise_estimate.noise_power_dbfs)
+        if noise_estimate.reference_domain is not None and noise_estimate.reference_domain != self.reference_domain:
+            raise PolicyCompatibilityError("Noise reference domain differs from detector path/gain")
         p_noise_lin = 10.0 ** (p_noise_dbfs / 10.0)
         if p_noise_lin <= 0.0 or not math.isfinite(p_noise_lin):
             raise UncalibratedNoiseError(
@@ -253,11 +317,17 @@ class EnergyDetector(DetectorProtocol, Resettable):
 
         if self._threshold_policy is not None and self._threshold_policy.mode == "empirical_matched":
             p_ref = self._threshold_policy.mean_power_linear
-            if not math.isclose(p_noise_lin, p_ref, rel_tol=0.05):
+            if noise_estimate.reference_domain is not None:
+                if noise_estimate.reference_domain != self.reference_domain:
+                    raise PolicyCompatibilityError("Noise reference domain differs from detector path/gain")
+            elif not math.isclose(p_noise_lin, p_ref, rel_tol=1e-12):
                 raise PolicyCompatibilityError(
-                    f"Noise reference power ({p_noise_lin}) is incompatible with empirical policy reference ({p_ref})"
+                    "Untagged noise reference may only replay the fixed calibration mean; "
+                    "supply reference_domain for compatible scale updates"
                 )
             scale_ratio = p_noise_lin / p_ref if p_ref > 0 else 1.0
+            if self._require_supported_pfa and not math.isclose(scale_ratio, 1.0, rel_tol=1e-12):
+                raise PolicyCompatibilityError("Held-out support applies to fixed calibrated thresholds; revalidate after scale updates")
             t_on_lin = self._threshold_policy.t_on_linear * scale_ratio
             t_off_lin = self._threshold_policy.t_off_linear * scale_ratio
             t_on_dbfs = 10.0 * math.log10(max(t_on_lin, self._conversion_floor))
@@ -268,10 +338,13 @@ class EnergyDetector(DetectorProtocol, Resettable):
                 t_on_lin = float(p_noise_lin * self._unit_q_on)
                 t_off_lin = float(p_noise_lin * self._unit_q_off)
             else:
-                a_param = getattr(self, "_n_eff", n) if self._mode == "configured_band" else n
-                scale = max(p_noise_lin, self._conversion_floor) / a_param
-                t_on_lin = float(gamma.isf(self._pfa_on, a=a_param, scale=scale))
-                t_off_lin = float(gamma.isf(self._pfa_off, a=a_param, scale=scale))
+                if self._mode == "configured_band":
+                    q_on, q_off = self._configured_quantiles(n)
+                    t_on_lin, t_off_lin = p_noise_lin * q_on, p_noise_lin * q_off
+                else:
+                    scale = p_noise_lin / n
+                    t_on_lin = float(gamma.isf(self._pfa_on, a=n, scale=scale))
+                    t_off_lin = float(gamma.isf(self._pfa_off, a=n, scale=scale))
             t_on_dbfs = 10.0 * math.log10(max(t_on_lin, self._conversion_floor))
             t_off_dbfs = 10.0 * math.log10(max(t_off_lin, self._conversion_floor))
 
@@ -308,6 +381,7 @@ class EnergyDetector(DetectorProtocol, Resettable):
         noise_estimate: NoiseEstimate,
     ) -> DetectionMeasurement:
         """Process an IQBlock as a single measurement window to conform to DetectorProtocol."""
+        self._validate_input(block)
         if block.num_samples == 0:
             raise ValueError("Input IQBlock must not be empty")
 
@@ -358,6 +432,7 @@ class EnergyDetector(DetectorProtocol, Resettable):
         Carries residual samples across blocks to maintain continuous, boundary-independent
         evaluation anchored to absolute source coordinates.
         """
+        self._validate_input(block)
         # Validate prerequisites BEFORE preparing detection IQ or mutating filter/phase state
         if not noise_estimate.valid or not math.isfinite(noise_estimate.noise_power_dbfs):
             raise UncalibratedNoiseError(

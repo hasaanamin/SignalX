@@ -1,6 +1,7 @@
 """Bandwidth feature extractor for RF signal analysis."""
 
 import math
+from dataclasses import replace
 from typing import Any
 
 import numpy as np
@@ -21,7 +22,7 @@ class BandwidthFeatureExtractor:
     """
 
     name: str = "bandwidth"
-    version: str = "1.0"
+    version: str = "2.0"
 
     def __init__(self, config: BandwidthFeatureConfig | None = None) -> None:
         """Initialize BandwidthFeatureExtractor.
@@ -35,6 +36,18 @@ class BandwidthFeatureExtractor:
                 f"Expected BandwidthFeatureConfig instance or None, got {type(config).__name__}"
             )
         self.config = config
+
+    def resolve_config(self, context: SignalContext | Any) -> BandwidthFeatureConfig:
+        """The single effective configuration used by both extraction and hashing."""
+        if self.config is not None:
+            return self.config
+        from dataclasses import fields
+        context_config = getattr(context, "config", None)
+        defaults = BandwidthFeatureConfig()
+        return BandwidthFeatureConfig(**{
+            f.name: getattr(context_config, "bandwidth_" + f.name, getattr(defaults, f.name))
+            for f in fields(defaults)
+        })
 
     def _make_invalid_featureset(self, reason: str) -> FeatureSet:
         """Create a FeatureSet with all features marked invalid."""
@@ -159,45 +172,15 @@ class BandwidthFeatureExtractor:
                 f"from median spacing of {df:.6g} Hz"
             )
 
-        # Resolve extraction configuration parameters
-        ctx_cfg = getattr(context, "config", None)
-        mode = self.config.mode if self.config is not None else getattr(ctx_cfg, "bandwidth_mode", "raw_psd")
-        roi_hz = self.config.roi_hz if self.config is not None else getattr(ctx_cfg, "bandwidth_roi_hz", None)
-        noise_floor_dbfs = (
-            self.config.noise_floor_dbfs_per_hz
-            if self.config is not None
-            else getattr(ctx_cfg, "bandwidth_noise_floor_dbfs_per_hz", None)
-        )
-        dominant_lobe_min_prominence_db = (
-            self.config.dominant_lobe_min_prominence_db
-            if self.config is not None
-            else getattr(ctx_cfg, "bandwidth_dominant_lobe_min_prominence_db", 3.0)
-        )
-        auto_noise_estimation = (
-            self.config.auto_noise_estimation
-            if self.config is not None
-            else True
-        )
-        interpolate_edges = (
-            self.config.interpolate_edges
-            if self.config is not None
-            else getattr(ctx_cfg, "bandwidth_interpolate_edges", False)
-        )
-        min_snr_db = (
-            self.config.min_snr_db
-            if self.config is not None
-            else 3.0
-        )
-        check_edge_clipping = (
-            self.config.check_edge_clipping
-            if self.config is not None
-            else True
-        )
-        multimodal_ratio_threshold = (
-            self.config.multimodal_ratio_threshold
-            if self.config is not None
-            else 0.7
-        )
+        cfg = self.resolve_config(context)
+        mode, roi_hz = cfg.mode, cfg.roi_hz
+        noise_floor_dbfs = cfg.noise_floor_dbfs_per_hz
+        dominant_lobe_min_prominence_db = cfg.dominant_lobe_min_prominence_db
+        auto_noise_estimation = cfg.auto_noise_estimation
+        interpolate_edges = cfg.interpolate_edges
+        min_snr_db = cfg.min_snr_db
+        check_edge_clipping = cfg.check_edge_clipping
+        multimodal_ratio_threshold = cfg.multimodal_ratio_threshold
 
         # Region of interest (ROI) selection
         if roi_hz is not None:
@@ -283,6 +266,10 @@ class BandwidthFeatureExtractor:
                 # boundaries without a wider observation window to certify physical emitter 99% containment
                 obw_tail_clipped = True
                 obw_clip_reason = "Cannot certify physical emitter 99% containment: observation is truncated at frequency boundary with no wider ROI"
+
+        if mode == "emitter" and cfg.occupied_power_scope == "physical_emitter" and not cfg.complete_observation:
+            obw_tail_clipped = True
+            obw_clip_reason = "Physical occupied bandwidth requires a complete-observation assumption and provenance"
 
         # 1. 99% Occupied Bandwidth
         if obw_tail_clipped:
@@ -431,8 +418,11 @@ class BandwidthFeatureExtractor:
                 )
 
         features = {
-            "bandwidth.occupied_99_hz": occupied_99_fv,
-            "bandwidth.three_db_hz": three_db_fv,
+            "bandwidth.occupied_99_hz": replace(
+                occupied_99_fv, interpretation=("raw_psd_within_roi" if mode == "raw_psd"
+                    else ("physical_emitter_under_declared_support" if cfg.occupied_power_scope == "physical_emitter"
+                          else "observed_excess_within_roi"))),
+            "bandwidth.three_db_hz": replace(three_db_fv, interpretation="observed_dominant_lobe_half_power"),
         }
 
         return FeatureSet(

@@ -39,7 +39,7 @@ class TestDefaultRegistry:
         # Verify each extractor in registry is an instance of FeatureExtractor protocol
         for ext in registry.extractors:
             assert isinstance(ext, FeatureExtractor)
-            assert ext.version == "1.0"
+            assert ext.version == ("2.0" if ext.name == "bandwidth" else "1.0")
 
     def test_fresh_registry_per_call(self) -> None:
         """build_default_feature_registry returns fresh instances on every invocation without shared mutable state."""

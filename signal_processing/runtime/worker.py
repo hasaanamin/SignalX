@@ -169,7 +169,7 @@ class FeatureAnalysisWorker:
 
     def _deliver_sink(self, result: CaptureSidecar, *args: Any, **kwargs: Any) -> None:
         """Invoke external result sink callback strictly outside lifecycle locks."""
-        generation = args[0] if args else getattr(result, "_generation", getattr(result, "stream_epoch", None))
+        generation = args[0] if args else result.processing_generation
         with self._lock:
             if generation is not None and generation < self._current_generation:
                 self._discarded_old_generation_count += 1
@@ -177,6 +177,12 @@ class FeatureAnalysisWorker:
             sinks_snapshot = list(self._result_sinks)
 
         for sink in sinks_snapshot:
+            # Admission is atomic with reset. An admitted callback may finish after
+            # reset; callbacks not yet admitted are suppressed, including reentrant reset.
+            with self._lock:
+                if generation is not None and generation != self._current_generation:
+                    self._discarded_old_generation_count += 1
+                    return
             try:
                 sink(result)
             except Exception:
@@ -185,10 +191,19 @@ class FeatureAnalysisWorker:
 
     def get_result(self, block: bool = True, timeout: float | None = None) -> CaptureSidecar | None:
         """Retrieve the next processed result from the result delivery queue."""
-        try:
-            return self._result_queue.get(block=block, timeout=timeout)
-        except queue.Empty:
-            return None
+        import time
+        deadline = None if timeout is None else time.monotonic() + timeout
+        while True:
+            remaining = None if deadline is None else max(0, deadline - time.monotonic())
+            try:
+                result = self._result_queue.get(block=block, timeout=remaining)
+            except queue.Empty:
+                return None
+            with self._lock:
+                generation = getattr(result, "processing_generation", None)
+                if generation is None or generation == self._current_generation:
+                    return result
+                self._discarded_old_generation_count += 1
 
     def _process_one(self, sidecar: CaptureSidecar) -> CaptureSidecar:
         # Quality Gate
@@ -222,6 +237,13 @@ class FeatureAnalysisWorker:
                 dropped_samples=sidecar.event.dropped_samples,
                 is_continuous=sidecar.event.dropped_samples == 0,
                 warnings=warns,
+                known_lost_samples=sidecar.known_lost_samples,
+                unknown_loss=sidecar.unknown_loss,
+                termination_reason=sidecar.termination_reason,
+                capture_epoch=sidecar.stream_epoch,
+                noise_valid=sidecar.noise_valid,
+                noise_provenance=sidecar.noise_provenance,
+                boundary_uncertainty_samples=sidecar.boundary_uncertainty_samples,
             )
             context = SignalContext(
                 event=sidecar.event, config=self._analysis_config, capture_quality=cap_quality
@@ -267,7 +289,7 @@ class FeatureAnalysisWorker:
 
             if self._synchronous:
                 result = self._process_one(sidecar)
-                result = dataclasses.replace(result, stream_epoch=gen)
+                result = dataclasses.replace(result, processing_generation=gen)
                 if self._record_result_locked(result, gen):
                     to_deliver = result
                 result_to_return = result
@@ -282,7 +304,7 @@ class FeatureAnalysisWorker:
                         feature_status="dropped_overload",
                         feature_reason="Feature worker queue full",
                     )
-                    dropped_result = dataclasses.replace(dropped_result, stream_epoch=gen)
+                    dropped_result = dataclasses.replace(dropped_result, processing_generation=gen)
                     if self._record_result_locked(dropped_result, gen):
                         to_deliver = dropped_result
                     result_to_return = dropped_result
@@ -318,7 +340,7 @@ class FeatureAnalysisWorker:
                         continue
 
                 result = self._process_one(sidecar)
-                result = dataclasses.replace(result, stream_epoch=gen)
+                result = dataclasses.replace(result, processing_generation=gen)
                 with self._lock:
                     if self._record_result_locked(result, gen):
                         to_deliver = result

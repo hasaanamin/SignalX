@@ -47,7 +47,7 @@ class TestBandwidthExtractor:
 
         assert isinstance(fset, FeatureSet)
         assert fset.extractor == "bandwidth"
-        assert fset.extractor_version == "1.0"
+        assert fset.extractor_version == "2.0"
         assert len(fset.features) == 2
 
         # 1. 99% OBW

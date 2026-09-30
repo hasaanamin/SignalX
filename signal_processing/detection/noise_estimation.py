@@ -5,14 +5,14 @@ from __future__ import annotations
 import enum
 import hashlib
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Literal
 
 import numpy as np
 from scipy import signal
-from scipy.stats import gamma
+from scipy.stats import beta, gamma
 
-from signal_processing.core.contracts import IQBlock, NoiseEstimate
+from signal_processing.core.contracts import IQBlock, NoiseEstimate, NoiseReferenceDomain
 from signal_processing.core.exceptions import ContractValidationError
 from signal_processing.core.interfaces import NoiseEstimatorProtocol, Resettable
 from signal_processing.detection.exceptions import PolicyCompatibilityError
@@ -30,7 +30,7 @@ class NoiseLifecycleState(enum.Enum):
 
 @dataclass(frozen=True)
 class ThresholdPolicy:
-    """Immutable statistically supported threshold policy for detector and pipeline."""
+    """Immutable threshold estimate with separate, conditional support evidence."""
 
     mode: Literal["analytic_gamma", "empirical_matched"]
     window_size: int
@@ -42,15 +42,26 @@ class ThresholdPolicy:
     t_off_linear: float
     t_on_dbfs: float
     t_off_dbfs: float
-    supported_pfa: bool = True
+    supported_pfa: bool = False
     sample_rate_hz: float = 1e6
     monitored_band_hz: tuple[float, float] | None = None
     filter_sos_hash: str | None = None
     training_samples: int = 0
     training_windows: int = 0
-    policy_version: str = "2.0"
+    policy_version: str = "3.0"
     valid: bool = True
     reason: str | None = None
+    reference_domain: NoiseReferenceDomain | None = None
+    support_method: str = "uncertified"
+    dependence_assumption: str = "unspecified"
+    confidence_level: float | None = None
+    validation_windows: int = 0
+    validation_exceedances_on: int = 0
+    validation_exceedances_off: int = 0
+    pfa_upper_on: float | None = None
+    pfa_upper_off: float | None = None
+    evidence_id: str | None = None
+    settling_samples: int = 0
 
     def __post_init__(self) -> None:
         if type(self.valid) is not bool:
@@ -100,13 +111,13 @@ class ThresholdPolicy:
             or float(self.t_on_dbfs) <= float(self.t_off_dbfs)
         ):
             raise ContractValidationError(f"Threshold dBFS invariant violated: t_on_dbfs ({self.t_on_dbfs}) must be > t_off_dbfs ({self.t_off_dbfs})")
-        exp_on_dbfs = 10.0 * math.log10(max(float(self.t_on_linear), 1e-15))
-        if not math.isclose(float(self.t_on_dbfs), exp_on_dbfs, abs_tol=0.5):
+        exp_on_dbfs = 10.0 * math.log10(float(self.t_on_linear))
+        if not math.isclose(float(self.t_on_dbfs), exp_on_dbfs, rel_tol=0, abs_tol=1e-9):
             raise ContractValidationError(
                 f"Contradictory linear/dBFS threshold: t_on_linear={self.t_on_linear} implies ~{exp_on_dbfs:.2f} dBFS, but t_on_dbfs={self.t_on_dbfs}"
             )
-        exp_off_dbfs = 10.0 * math.log10(max(float(self.t_off_linear), 1e-15))
-        if not math.isclose(float(self.t_off_dbfs), exp_off_dbfs, abs_tol=0.5):
+        exp_off_dbfs = 10.0 * math.log10(float(self.t_off_linear))
+        if not math.isclose(float(self.t_off_dbfs), exp_off_dbfs, rel_tol=0, abs_tol=1e-9):
             raise ContractValidationError(
                 f"Contradictory linear/dBFS threshold: t_off_linear={self.t_off_linear} implies ~{exp_off_dbfs:.2f} dBFS, but t_off_dbfs={self.t_off_dbfs}"
             )
@@ -130,8 +141,68 @@ class ThresholdPolicy:
             raise ContractValidationError(f"training_samples must be an integer >= 0, got {self.training_samples!r}")
         if isinstance(self.training_windows, bool) or not isinstance(self.training_windows, (int, np.integer)) or self.training_windows < 0:
             raise ContractValidationError(f"training_windows must be an integer >= 0, got {self.training_windows!r}")
-        if self.valid and self.mode == "empirical_matched" and not self.supported_pfa:
-            raise ContractValidationError("Empirical matched policy cannot be marked valid without supported_pfa=True")
+        if self.reference_domain is not None:
+            expected = NoiseReferenceDomain(self.sample_rate_hz, self.monitored_band_hz,
+                                            self.filter_sos_hash, self.reference_domain.gain_id)
+            if self.reference_domain != expected:
+                raise ContractValidationError("Reference domain contradicts policy path")
+        if self.mode == "empirical_matched" and self.supported_pfa and self.support_method != "held_out_clopper_pearson_bonferroni":
+            raise ContractValidationError("Empirical support requires explicit held-out confidence evidence")
+        if self.support_method == "held_out_clopper_pearson_bonferroni":
+            if self.confidence_level is None or not 0 < self.confidence_level < 1:
+                raise ContractValidationError("Invalid confidence level")
+            if self.validation_windows < 1 or not self.evidence_id:
+                raise ContractValidationError("Held-out support requires evidence and independent windows")
+            if self.dependence_assumption != "independent_held_out_windows":
+                raise ContractValidationError("Held-out support requires an explicit independence assumption")
+            for count in (self.validation_exceedances_on, self.validation_exceedances_off):
+                if isinstance(count, bool) or not isinstance(count, (int, np.integer)) or not 0 <= count <= self.validation_windows:
+                    raise ContractValidationError("Invalid held-out exceedance count")
+            level = 1 - (1 - self.confidence_level) / 2
+            for count, upper in ((self.validation_exceedances_on, self.pfa_upper_on), (self.validation_exceedances_off, self.pfa_upper_off)):
+                expected = 1.0 if count == self.validation_windows else float(beta.ppf(level, count + 1, self.validation_windows - count))
+                if upper is None or not math.isclose(upper, expected, rel_tol=1e-12):
+                    raise ContractValidationError("Confidence bound contradicts held-out counts")
+            if self.supported_pfa and (self.pfa_upper_on is None or self.pfa_upper_off is None
+                                      or self.pfa_upper_on > self.pfa_on or self.pfa_upper_off > self.pfa_off):
+                raise ContractValidationError("Certified support contradicts confidence bounds")
+
+    def validate_held_out(
+        self, window_powers: np.ndarray, *, reference_domain: NoiseReferenceDomain,
+        independence_assumption: str, evidence_id: str, confidence_level: float = 0.95,
+    ) -> ThresholdPolicy:
+        """Validate fixed thresholds on caller-authorized independent held-out powers.
+
+        No independence is inferred from sample spacing or filter output. Both
+        ON/OFF upper bounds have joint confidence at least confidence_level via
+        Bonferroni. Bounds apply to these absolute thresholds and this domain;
+        rescaling to a newly estimated reference requires new validation.
+        """
+        if reference_domain != self.reference_domain or self.reference_domain is None:
+            raise PolicyCompatibilityError("Held-out evidence must identify the calibration domain")
+        if independence_assumption != "independent_held_out_windows":
+            raise ValueError("Declare independent_held_out_windows; correlated data cannot certify support")
+        if not isinstance(evidence_id, str) or not evidence_id.strip():
+            raise ValueError("evidence_id must identify the held-out acquisition")
+        if isinstance(confidence_level, bool) or not 0 < confidence_level < 1:
+            raise ValueError("confidence_level must lie in (0, 1)")
+        powers = np.asarray(window_powers)
+        if powers.ndim != 1 or len(powers) == 0 or np.iscomplexobj(powers):
+            raise ValueError("Expected nonempty real window powers")
+        if not np.all(np.isfinite(powers)) or np.any(powers < 0):
+            raise ValueError("Window powers must be finite and nonnegative")
+        n = len(powers)
+        on, off = int(np.count_nonzero(powers >= self.t_on_linear)), int(np.count_nonzero(powers >= self.t_off_linear))
+        level = 1 - (1 - confidence_level) / 2
+        def upper(k: int) -> float:
+            return 1.0 if k == n else float(beta.ppf(level, k + 1, n - k))
+        u_on, u_off = upper(on), upper(off)
+        return replace(self, supported_pfa=u_on <= self.pfa_on and u_off <= self.pfa_off,
+                       support_method="held_out_clopper_pearson_bonferroni",
+                       dependence_assumption=independence_assumption, evidence_id=evidence_id,
+                       confidence_level=confidence_level, validation_windows=n,
+                       validation_exceedances_on=on, validation_exceedances_off=off,
+                       pfa_upper_on=u_on, pfa_upper_off=u_off)
 
 
 class GaussianNoiseEstimator(NoiseEstimatorProtocol, Resettable):
@@ -156,6 +227,8 @@ class GaussianNoiseEstimator(NoiseEstimatorProtocol, Resettable):
         warmup_blocks: int = 0,
         warmup_samples: int | None = None,
         conversion_floor_linear: float = 1e-15,
+        reference_domain: NoiseReferenceDomain | None = None,
+        warmup_settling_samples: int = 0,
     ) -> None:
         if isinstance(window_size, bool) or not isinstance(window_size, (int, np.integer)) or window_size < 1:
             raise ValueError(f"window_size must be >= 1, got {window_size!r}")
@@ -186,7 +259,12 @@ class GaussianNoiseEstimator(NoiseEstimatorProtocol, Resettable):
         ):
             raise ValueError(f"conversion_floor_linear must be strictly positive and finite, got {conversion_floor_linear!r}")
 
+        if isinstance(warmup_settling_samples, bool) or not isinstance(warmup_settling_samples, (int, np.integer)) or warmup_settling_samples < 0:
+            raise ValueError("warmup_settling_samples must be a nonnegative integer")
+        self._warmup_settling_total = int(warmup_settling_samples)
+        self._warmup_settling_remaining = self._warmup_settling_total
         self._window_size = int(window_size)
+        self.reference_domain = reference_domain
         self._pfa_on = float(pfa_on)
         self._pfa_off = float(pfa_off)
         self._conversion_floor = float(conversion_floor_linear)
@@ -203,7 +281,7 @@ class GaussianNoiseEstimator(NoiseEstimatorProtocol, Resettable):
             self._warmup_samples = self._warmup_blocks * self._window_size
             self._target_warmup_samples = self._warmup_samples
 
-        self._warmup_powers: list[tuple[float, int]] = []
+        self._warmup_power_sum: float = 0.0
         self._warmup_samples_collected: int = 0
         self._frozen: bool = False
         self._suspended: bool = False
@@ -280,7 +358,7 @@ class GaussianNoiseEstimator(NoiseEstimatorProtocol, Resettable):
         """Remaining samples needed to complete calibration."""
         if self._state != NoiseLifecycleState.CALIBRATING:
             return 0
-        return max(0, self._target_warmup_samples - self._warmup_samples_collected)
+        return self._warmup_settling_remaining + max(0, self._target_warmup_samples - self._warmup_samples_collected)
 
     @property
     def samples_trained(self) -> int:
@@ -318,6 +396,8 @@ class GaussianNoiseEstimator(NoiseEstimatorProtocol, Resettable):
             noise_power_dbfs=noise_dbfs,
             valid=True,
             reason=None,
+            reference_domain=self.reference_domain,
+            training_samples=self._warmup_samples_collected,
         )
 
     def update_samples(self, samples_iq: np.ndarray) -> int:
@@ -331,6 +411,15 @@ class GaussianNoiseEstimator(NoiseEstimatorProtocol, Resettable):
         if self._state != NoiseLifecycleState.CALIBRATING:
             return 0
 
+        if not isinstance(samples_iq, np.ndarray) or samples_iq.ndim != 1 or not np.iscomplexobj(samples_iq):
+            raise ValueError("Training samples must be a complex 1D array")
+        budget = self.remaining_warmup_samples
+        if not np.all(np.isfinite(samples_iq[:budget])):
+            raise ValueError("Training samples must be finite")
+        discarded = min(len(samples_iq), self._warmup_settling_remaining)
+        self._warmup_settling_remaining -= discarded
+        samples_iq = samples_iq[discarded:]
+
         target_samples = self._target_warmup_samples
         remaining = target_samples - self._warmup_samples_collected
         if remaining <= 0:
@@ -343,16 +432,16 @@ class GaussianNoiseEstimator(NoiseEstimatorProtocol, Resettable):
         mag_sq = np.real(c128) ** 2 + np.imag(c128) ** 2
         p_sum = float(np.sum(mag_sq))
         if p_sum >= 0.0 and math.isfinite(p_sum):
-            self._warmup_powers.append((p_sum, n_consume))
+            self._warmup_power_sum += p_sum
             self._warmup_samples_collected += n_consume
 
             if self._warmup_samples_collected >= target_samples:
-                total_p = sum(p for p, _ in self._warmup_powers)
-                total_s = sum(s for _, s in self._warmup_powers)
+                total_p = self._warmup_power_sum
+                total_s = self._warmup_samples_collected
                 if total_s > 0:
                     self._noise_power_linear = max(float(total_p / total_s), self._conversion_floor)
                     self._state = NoiseLifecycleState.VALID
-        return n_consume
+        return discarded + n_consume
 
     def suspend_training(self) -> None:
         """Suspend warmup noise ingestion until explicit authorized recalibration."""
@@ -375,8 +464,9 @@ class GaussianNoiseEstimator(NoiseEstimatorProtocol, Resettable):
             self._target_warmup_samples = max(getattr(self, "_target_warmup_samples", 0), self._window_size)
             self._warmup_samples = self._target_warmup_samples
         self._noise_power_linear = None
-        self._warmup_powers.clear()
+        self._warmup_power_sum = 0.0
         self._warmup_samples_collected = 0
+        self._warmup_settling_remaining = self._warmup_settling_total
         self._frozen = False
         self._suspended = False
         self._state = NoiseLifecycleState.CALIBRATING
@@ -384,8 +474,9 @@ class GaussianNoiseEstimator(NoiseEstimatorProtocol, Resettable):
     def reset(self) -> None:
         """Reset estimator state."""
         self._noise_power_linear = self._initial_noise_power
-        self._warmup_powers.clear()
+        self._warmup_power_sum = 0.0
         self._warmup_samples_collected = 0
+        self._warmup_settling_remaining = self._warmup_settling_total
         self._frozen = False
         self._suspended = False
         if self._initial_noise_power is not None:
@@ -418,6 +509,7 @@ class AdaptiveRobustNoiseEstimator(NoiseEstimatorProtocol, Resettable):
         initial_noise_power_linear: float | None = None,
         adaptation_window_size: int = 64,
         max_staleness_samples: int = 1_000_000,
+        reference_domain: NoiseReferenceDomain | None = None,
     ) -> None:
         if isinstance(window_size, bool) or not isinstance(window_size, (int, np.integer)) or window_size < 1:
             raise ValueError(f"window_size must be >= 1, got {window_size!r}")
@@ -474,6 +566,7 @@ class AdaptiveRobustNoiseEstimator(NoiseEstimatorProtocol, Resettable):
         self._conversion_floor = float(conversion_floor_linear)
         self._adaptation_window_size = int(adaptation_window_size)
         self._max_staleness_samples = int(max_staleness_samples)
+        self.reference_domain = reference_domain
 
         self._initial_noise_power = (
             float(initial_noise_power_linear) if initial_noise_power_linear is not None else None
@@ -486,6 +579,7 @@ class AdaptiveRobustNoiseEstimator(NoiseEstimatorProtocol, Resettable):
         self._adaptation_residual: np.ndarray = np.empty(0, dtype=np.complex64)
         self._samples_since_last_accepted: int = 0
         self._total_accepted_samples: int = 0
+        self._pending_stream_samples: int = 0
 
         self._unit_q_on = float(gamma.isf(self._pfa_on, a=self._window_size, scale=1.0 / self._window_size))
         self._unit_q_off = float(gamma.isf(self._pfa_off, a=self._window_size, scale=1.0 / self._window_size))
@@ -518,7 +612,7 @@ class AdaptiveRobustNoiseEstimator(NoiseEstimatorProtocol, Resettable):
     @property
     def staleness_samples(self) -> int:
         """Samples elapsed since the last accepted noise update."""
-        return self._samples_since_last_accepted + len(self._adaptation_residual)
+        return self._samples_since_last_accepted + len(self._adaptation_residual) + self._pending_stream_samples
 
     @property
     def _accepted_noise_samples(self) -> int:
@@ -537,7 +631,19 @@ class AdaptiveRobustNoiseEstimator(NoiseEstimatorProtocol, Resettable):
 
     def freeze(self, frozen: bool) -> None:
         """Freeze adaptation when a candidate, active, or trailing burst is present."""
+        if frozen and not self._frozen:
+            # A statistic must never straddle an excluded active interval.
+            self._samples_since_last_accepted += len(self._adaptation_residual)
+            self._adaptation_residual = np.empty(0, dtype=np.complex64)
         self._frozen = bool(frozen)
+
+    def set_pending_samples(self, num_samples: int) -> None:
+        """Account for received IQ awaiting a causal admission decision, without training."""
+        if isinstance(num_samples, bool) or not isinstance(num_samples, (int, np.integer)) or num_samples < 0:
+            raise ValueError("num_samples must be a non-negative integer")
+        self._pending_stream_samples = int(num_samples)
+        if self.staleness_samples > self._max_staleness_samples and self._state == NoiseLifecycleState.VALID:
+            self._state = NoiseLifecycleState.STALE
 
     def advance_stream_samples(self, num_samples: int) -> None:
         """Advance logical stream sample count to track staleness even while frozen."""
@@ -587,6 +693,7 @@ class AdaptiveRobustNoiseEstimator(NoiseEstimatorProtocol, Resettable):
             noise_power_dbfs=noise_dbfs,
             valid=True,
             reason=None,
+            reference_domain=self.reference_domain,
         )
 
     def update_samples(self, samples_iq: np.ndarray) -> None:
@@ -676,6 +783,8 @@ class AdaptiveRobustNoiseEstimator(NoiseEstimatorProtocol, Resettable):
         self._adaptation_residual = np.empty(0, dtype=np.complex64)
         self._samples_since_last_accepted = 0
 
+        self._pending_stream_samples = 0
+
     def reset(self) -> None:
         self._noise_power_linear = self._initial_noise_power
         self._frozen = False
@@ -683,6 +792,7 @@ class AdaptiveRobustNoiseEstimator(NoiseEstimatorProtocol, Resettable):
         self._adaptation_residual = np.empty(0, dtype=np.complex64)
         self._samples_since_last_accepted = 0
         self._total_accepted_samples = 0
+        self._pending_stream_samples = 0
         self._state = (
             NoiseLifecycleState.VALID if self._initial_noise_power is not None else NoiseLifecycleState.UNCALIBRATED
         )
@@ -726,6 +836,7 @@ class EmpiricalNoiseCalibrator:
         settling_samples: int = 0,
         monitored_band_hz: tuple[float, float] | None = None,
         filter_order: int = 4,
+        gain_id: str = "digital_iq_unity",
     ) -> None:
         """Initialize streaming bounded calibration state."""
         if isinstance(sample_rate_hz, bool) or not math.isfinite(sample_rate_hz) or sample_rate_hz <= 0:
@@ -739,6 +850,10 @@ class EmpiricalNoiseCalibrator:
             nyquist = float(sample_rate_hz) / 2.0
             if not (-nyquist <= f_min < f_max <= nyquist):
                 raise ValueError(f"monitored_band_hz ({f_min}, {f_max}) outside valid Nyquist interval [-{nyquist}, {nyquist}]")
+            if f_max - f_min >= sample_rate_hz:
+                raise ValueError("Configured filter bandwidth must be less than sample rate")
+        if not isinstance(gain_id, str) or not gain_id.strip():
+            raise ValueError("gain_id must be a nonblank string")
 
         self._cal_sample_rate_hz = float(sample_rate_hz)
         self._cal_settling_remaining = int(settling_samples)
@@ -768,9 +883,14 @@ class EmpiricalNoiseCalibrator:
         self._cal_sample_sum_sq = 0.0
         self._cal_residual_iq = np.empty(0, dtype=np.complex64)
         self._cal_window_powers: list[float] = []
+        self._cal_reference_domain = NoiseReferenceDomain(
+            self._cal_sample_rate_hz, self._cal_monitored_band_hz, self._cal_sos_hash, gain_id
+        )
 
     def update_calibration(self, chunk: np.ndarray) -> None:
         """Ingest a chunk of training noise samples in a bounded streaming manner."""
+        if not hasattr(self, "_cal_samples_collected"):
+            raise RuntimeError("Call begin_calibration before update_calibration")
         if getattr(self, "_finalized", False):
             raise RuntimeError("Calibration has been finalized")
         if not isinstance(chunk, np.ndarray) or chunk.ndim != 1:
@@ -857,7 +977,6 @@ class EmpiricalNoiseCalibrator:
 
     def finalize_calibration(self) -> dict[str, Any]:
         """Finalize calibration and return result dictionary with full parameter identity."""
-        self._finalized = True
         if self._cal_samples_collected < self.window_size:
             raise ValueError(
                 f"Insufficient valid calibration samples ({self._cal_samples_collected}) for window size {self.window_size}"
@@ -873,10 +992,12 @@ class EmpiricalNoiseCalibrator:
 
         required_windows_on = int(math.ceil(1.0 / self.pfa_on))
         required_windows_off = int(math.ceil(1.0 / self.pfa_off))
-        independent_windows = self._cal_samples_collected // self.window_size
-        supported_pfa = (n_windows > required_windows_on) and (independent_windows > required_windows_on)
+        quantile_resolved = n_windows > required_windows_on
+        # Training-window count is resolution, never evidence of independence or
+        # a confidence statement about future false alarms.
+        supported_pfa = False
 
-        if supported_pfa and n_windows > 0:
+        if quantile_resolved and n_windows > 0:
             emp_t_on = float(np.quantile(win_powers, 1.0 - self.pfa_on))
         else:
             emp_t_on = None
@@ -889,6 +1010,8 @@ class EmpiricalNoiseCalibrator:
         scale = mean_power / w_size
         gamma_t_on = float(gamma.isf(self.pfa_on, a=w_size, scale=scale))
         gamma_t_off = float(gamma.isf(self.pfa_off, a=w_size, scale=scale))
+
+        self._finalized = True
 
         return {
             "mean_power_linear": mean_power,
@@ -907,6 +1030,10 @@ class EmpiricalNoiseCalibrator:
             "pfa_off": self.pfa_off,
             "sample_rate_hz": self._cal_sample_rate_hz,
             "supported_pfa": supported_pfa,
+            "quantile_resolved": quantile_resolved,
+            "reference_domain": self._cal_reference_domain,
+            "support_method": "uncertified_training_quantile",
+            "dependence_assumption": "unspecified",
             "monitored_band_hz": self._cal_monitored_band_hz,
             "filter_order": self._cal_filter_order,
             "filter_sos_hash": self._cal_sos_hash,
@@ -991,7 +1118,7 @@ class EmpiricalNoiseCalibrator:
         emp_on = cal["empirical_t_on_linear"]
         emp_off = cal["empirical_t_off_linear"]
 
-        if supported and emp_on is not None and emp_off is not None:
+        if emp_on is not None and emp_off is not None:
             t_on_lin = emp_on
             t_off_lin = emp_off
             mode: Literal["analytic_gamma", "empirical_matched"] = "empirical_matched"
@@ -1004,13 +1131,13 @@ class EmpiricalNoiseCalibrator:
             valid = False
             reason = f"Insufficient sample support ({cal['num_windows']} windows < {int(1.0/self.pfa_on)} required)"
 
-        t_on_dbfs = 10.0 * math.log10(max(t_on_lin, 1e-15))
-        t_off_dbfs = 10.0 * math.log10(max(t_off_lin, 1e-15))
+        t_on_dbfs = 10.0 * math.log10(t_on_lin)
+        t_off_dbfs = 10.0 * math.log10(t_off_lin)
 
         # Enforce strict invariant: on > off
         if t_on_lin <= t_off_lin:
             t_on_lin = t_off_lin * 1.01
-            t_on_dbfs = 10.0 * math.log10(max(t_on_lin, 1e-15))
+            t_on_dbfs = 10.0 * math.log10(t_on_lin)
 
         return ThresholdPolicy(
             mode=mode,
@@ -1031,4 +1158,8 @@ class EmpiricalNoiseCalibrator:
             training_windows=cal["num_windows"],
             valid=valid,
             reason=reason,
+            reference_domain=cal.get("reference_domain"),
+            support_method="uncertified_training_quantile",
+            dependence_assumption="unspecified",
+            settling_samples=int(cal.get("settling_samples", 0)),
         )

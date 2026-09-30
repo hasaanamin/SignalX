@@ -416,6 +416,34 @@ class IQBlock:
 # ---------------------------------------------------------------------------
 
 @dataclass(frozen=True)
+class NoiseReferenceDomain:
+    """Identity of a measurement path; power and statistical uncertainty are separate.
+
+    gain_id identifies the caller's gain convention, not a measured hardware gain.
+    A receiver gain change requires a new identity and authorized recalibration.
+    """
+
+    sample_rate_hz: float
+    monitored_band_hz: tuple[float, float] | None = None
+    filter_sos_hash: str | None = None
+    gain_id: str = "digital_iq_unity"
+
+    def __post_init__(self) -> None:
+        fs = _validate_finite_float(self.sample_rate_hz, "sample_rate_hz")
+        if fs <= 0:
+            raise ContractValidationError("sample_rate_hz must be positive")
+        _validate_non_blank_str(self.gain_id, "gain_id")
+        if self.monitored_band_hz is not None:
+            band = tuple(self.monitored_band_hz)
+            if len(band) != 2 or not (-fs / 2 <= band[0] < band[1] <= fs / 2):
+                raise ContractValidationError("Invalid monitored band")
+            object.__setattr__(self, "monitored_band_hz", band)
+            _validate_non_blank_str(self.filter_sos_hash, "filter_sos_hash")
+        elif self.filter_sos_hash is not None:
+            raise ContractValidationError("Full-band reference cannot have a filter hash")
+
+
+@dataclass(frozen=True)
 class NoiseEstimate:
     """Estimated background noise level produced by a noise estimator.
 
@@ -434,10 +462,17 @@ class NoiseEstimate:
     noise_power_dbfs: float
     valid: bool = True
     reason: str | None = None
+    reference_domain: NoiseReferenceDomain | None = None
+    training_samples: int = 0
+    uncertainty_method: str = "unspecified"
 
     def __post_init__(self) -> None:
         _validate_non_blank_str(self.stream_id, "stream_id")
         _validate_non_negative_int(self.block_sequence_number, "block_sequence_number")
+
+        if self.reference_domain is not None and not isinstance(self.reference_domain, NoiseReferenceDomain):
+            raise ContractValidationError("reference_domain must be a NoiseReferenceDomain")
+        _validate_non_negative_int(self.training_samples, "training_samples")
 
         if not isinstance(self.valid, bool):
             raise ContractValidationError("Field 'valid' must be a boolean")
@@ -1002,6 +1037,14 @@ class AutocorrelationResult:
 # Feature Contracts
 # ---------------------------------------------------------------------------
 
+class FrozenDict(dict):
+    """JSON/asdict-compatible immutable mapping (including in-place union)."""
+
+    def _immutable(self, *args: Any, **kwargs: Any) -> None:
+        raise TypeError("Mapping is immutable")
+
+    __setitem__ = __delitem__ = clear = pop = popitem = setdefault = update = __ior__ = _immutable
+
 @dataclass(frozen=True)
 class FeatureValue:
     """A single extracted scalar feature value with validity metadata.
@@ -1017,6 +1060,7 @@ class FeatureValue:
     unit: str | None = None
     valid: bool = True
     reason: str | None = None
+    interpretation: str | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.valid, bool):
@@ -1226,11 +1270,24 @@ class CaptureQuality:
     dropped_samples: int
     is_continuous: bool
     warnings: tuple[str, ...] = ()
+    known_lost_samples: int = 0
+    unknown_loss: bool = False
+    termination_reason: str | None = None
+    capture_epoch: int | None = None
+    noise_valid: bool | None = None
+    noise_provenance: str | None = None
+    boundary_uncertainty_samples: int | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.complete, bool):
             raise ContractValidationError(f"complete must be a boolean, got {self.complete!r}")
         _validate_non_negative_int(self.dropped_samples, "dropped_samples")
+        _validate_non_negative_int(self.known_lost_samples, "known_lost_samples")
+        for name in ("capture_epoch", "boundary_uncertainty_samples"):
+            if getattr(self, name) is not None:
+                _validate_non_negative_int(getattr(self, name), name)
+        if type(self.unknown_loss) is not bool or (self.noise_valid is not None and type(self.noise_valid) is not bool):
+            raise ContractValidationError("Loss and calibration trust flags must be boolean")
         if not isinstance(self.is_continuous, bool):
             raise ContractValidationError(f"is_continuous must be a boolean, got {self.is_continuous!r}")
         if self.dropped_samples > 0 and self.complete:
@@ -1276,6 +1333,11 @@ class ExtractionPolicy:
     amplitude_ddof: int = 1
     check_edge_clipping: bool = True
     extractor_versions: dict[str, str] = field(default_factory=dict)
+    bandwidth_auto_noise_estimation: bool = True
+    bandwidth_multimodal_ratio_threshold: float = 0.7
+    bandwidth_occupied_power_scope: str = "observed_excess"
+    bandwidth_complete_observation: bool = False
+    bandwidth_support_provenance: str | None = None
 
     def __post_init__(self) -> None:
         _validate_non_blank_str(self.policy_id, "policy_id")
@@ -1287,9 +1349,27 @@ class ExtractionPolicy:
         _validate_non_blank_str(self.spectral_window, "spectral_window")
         if not isinstance(self.feature_names, tuple):
             object.__setattr__(self, "feature_names", tuple(self.feature_names))
-        if isinstance(self.extractor_versions, dict):
-            # Freeze/copy dict
-            object.__setattr__(self, "extractor_versions", dict(self.extractor_versions))
+        object.__setattr__(self, "extractor_versions", FrozenDict(self.extractor_versions))
+        if self.bandwidth_roi_hz is not None:
+            object.__setattr__(self, "bandwidth_roi_hz", tuple(self.bandwidth_roi_hz))
+
+    def to_dict(self) -> dict:
+        """Canonical JSON-ready policy with no mutable aliases to this record."""
+        import json
+        from dataclasses import asdict
+        return json.loads(json.dumps(asdict(self)))
+
+    @classmethod
+    def from_dict(cls, record: Mapping) -> ExtractionPolicy:
+        import hashlib
+        import json
+        values = dict(record)
+        policy_id = values.pop("policy_id")
+        values["feature_names"] = sorted(values["feature_names"])
+        digest = hashlib.sha256(json.dumps(values, sort_keys=True).encode()).hexdigest()[:12]
+        if policy_id != f"policy_{values['schema_version']}_{digest}":
+            raise ContractValidationError("Policy content does not match its identity")
+        return cls(policy_id=policy_id, **values)
 
 
 @dataclass(frozen=True)

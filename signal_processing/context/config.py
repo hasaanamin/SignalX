@@ -50,6 +50,13 @@ class AnalysisConfig:
     bandwidth_dominant_lobe_min_prominence_db: float = 3.0
     bandwidth_mode: str = "raw_psd"
     bandwidth_interpolate_edges: bool = False
+    bandwidth_auto_noise_estimation: bool = True
+    bandwidth_min_snr_db: float = 3.0
+    bandwidth_check_edge_clipping: bool = True
+    bandwidth_multimodal_ratio_threshold: float = 0.7
+    bandwidth_occupied_power_scope: str = "observed_excess"
+    bandwidth_complete_observation: bool = False
+    bandwidth_support_provenance: str | None = None
 
     def __post_init__(self) -> None:
         # Validate nfft

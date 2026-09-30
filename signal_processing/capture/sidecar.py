@@ -40,6 +40,7 @@ class CaptureSidecar:
     features: FeatureVector | None = None
     analysis_result: AnalysisResult | None = None
     reopened_count: int = 0
+    processing_generation: int | None = None
 
     def with_features(
         self,
@@ -75,4 +76,5 @@ class CaptureSidecar:
             features=features,
             analysis_result=analysis_result if analysis_result is not None else self.analysis_result,
             reopened_count=self.reopened_count,
+            processing_generation=self.processing_generation,
         )

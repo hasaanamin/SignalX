@@ -223,7 +223,9 @@ def signed_band_contracts():
     except Exception as e:r.append({'api':'EnergyDetector','accepted':False,'error':type(e).__name__})
     try:EmpiricalNoiseCalibrator(window_size=16).begin_calibration(monitored_band_hz=band);r.append({'api':'EmpiricalNoiseCalibrator','accepted':True})
     except Exception as e:r.append({'api':'EmpiricalNoiseCalibrator','accepted':False,'error':type(e).__name__})
-    q=EmpiricalNoiseCalibrator(window_size=16,hop_size=16,pfa_on=.01,pfa_off=.1).create_policy(noise(1600),settling_samples=0)
+    # Exercise a genuinely negative-band calibration; relabeling a full-band
+    # reference now correctly violates the immutable domain contract.
+    q=EmpiricalNoiseCalibrator(window_size=16,hop_size=16,pfa_on=.01,pfa_off=.1).create_policy(noise(20000),monitored_band_hz=band,settling_samples=4096)
     try:dataclasses.replace(q,monitored_band_hz=band);r.append({'api':'ThresholdPolicy','accepted':True})
     except Exception as e:r.append({'api':'ThresholdPolicy','accepted':False,'error':type(e).__name__})
     return r

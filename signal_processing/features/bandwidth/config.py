@@ -37,8 +37,17 @@ class BandwidthFeatureConfig:
     min_snr_db: float = 3.0
     check_edge_clipping: bool = True
     multimodal_ratio_threshold: float = 0.7
+    occupied_power_scope: Literal["observed_excess", "physical_emitter"] = "observed_excess"
+    complete_observation: bool = False
+    support_provenance: str | None = None
 
     def __post_init__(self) -> None:
+        if self.occupied_power_scope not in ("observed_excess", "physical_emitter"):
+            raise BandwidthFeatureError("Unknown occupied_power_scope")
+        if type(self.complete_observation) is not bool:
+            raise BandwidthFeatureError("complete_observation must be boolean")
+        if self.complete_observation and (not isinstance(self.support_provenance, str) or not self.support_provenance.strip()):
+            raise BandwidthFeatureError("Complete observation requires explicit support_provenance")
         if self.roi_hz is not None:
             if not isinstance(self.roi_hz, (tuple, list)) or len(self.roi_hz) != 2:
                 raise BandwidthFeatureError(

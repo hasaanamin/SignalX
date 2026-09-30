@@ -1,4 +1,4 @@
-"""Positive filtered-statistic, lifecycle and capture checks with supported empirical policy."""
+"""Positive filtered-statistic, lifecycle and capture checks with an empirical estimate."""
 from pathlib import Path
 import sys,json,math,hashlib
 import numpy as np
@@ -20,12 +20,12 @@ for bs in (257,65536,len(train)):
  c.begin_calibration(monitored_band_hz=(90000,110000),settling_samples=4096)
  for start in range(0,len(train),bs):c.update_calibration(train[start:start+bs])
  r=c.finalize_calibration()
- assert r['supported_pfa']
+ assert r['quantile_resolved'] and not r['supported_pfa']
  for key in ('mean_power_linear','empirical_t_on_linear','empirical_t_off_linear'):
   np.testing.assert_allclose(r[key],reference[key],rtol=1e-7,atol=1e-15)
  rows.append({'block_size':bs,'samples':r['num_samples'],'windows':r['num_windows'],'mean':r['mean_power_linear'],'t_on':r['t_on_linear'],
               'maximum_relative_difference':max(abs(r[key]-reference[key])/reference[key] for key in ('mean_power_linear','empirical_t_on_linear','empirical_t_off_linear'))})
-out['supported_empirical_streaming_vs_batch']=rows
+out['empirical_streaming_vs_batch_uncertified']=rows
 policy=cal.create_policy(reference)
 stream=StreamInfo('filtered','oracle',1e6)
 x=((rng.normal(size=12000)+1j*rng.normal(size=12000))*.01).astype(np.complex64)
@@ -55,4 +55,3 @@ p.shutdown()
 out['EOF_terminal_reset_replay']={'passed':True,'exact_replayed_iq':True}
 Path(__file__).with_suffix('.json').write_text(json.dumps(out,indent=2))
 print(json.dumps(out,indent=2))
-

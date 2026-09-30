@@ -71,6 +71,8 @@ class StreamingCapturePipeline:
         max_worker_queue_size: int = 32,
         analysis_config: AnalysisConfig | None = None,
         threshold_policy: ThresholdPolicy | None = None,
+        gain_id: str = "digital_iq_unity",
+        require_supported_pfa: bool = False,
     ) -> None:
         if isinstance(window_size, bool) or not isinstance(window_size, (int, np.integer)) or window_size < 1:
             raise ValueError(f"window_size must be an integer >= 1, got {window_size!r}")
@@ -120,6 +122,8 @@ class StreamingCapturePipeline:
             monitored_band_hz=monitored_band_hz,
             sample_rate_hz=stream_info.sample_rate_hz,
             threshold_policy=threshold_policy,
+            gain_id=gain_id,
+            require_supported_pfa=require_supported_pfa,
         )
 
         filter_delay = getattr(self._detector, "filter_delay_samples", 0)
@@ -175,9 +179,11 @@ class StreamingCapturePipeline:
 
         self._enable_feature_analysis = bool(enable_feature_analysis)
         self._previous_block: IQBlock | None = None
-        self._noise_admission_sample: int = 0
+        self._noise_admission_sample: int | None = None
         self._pending_noise_buf: np.ndarray = np.empty(0, dtype=np.complex64)
-        self._pending_noise_iq: list[np.ndarray] = []
+        # Compatibility view: no IQ history is retained here.
+        self._pending_noise_iq: tuple = ()
+        self._received_end_sample: int | None = None
         self._input_residual_iq: np.ndarray = np.empty(0, dtype=np.complex64)
         self._input_residual_start: int = 0
 
@@ -224,6 +230,17 @@ class StreamingCapturePipeline:
         return self._worker
 
     def process_block(self, block: IQBlock) -> list[CaptureSidecar]:
+        try:
+            return self._process_block(block)
+        except StreamConsistencyError:
+            # Metadata validation is pre-commit and can be retried.
+            raise
+        except Exception:
+            if self._state != PipelineState.EOF:
+                self._state = PipelineState.FAULTED
+            raise
+
+    def _process_block(self, block: IQBlock) -> list[CaptureSidecar]:
         """Process incoming IQBlock chunk through the streaming pipeline."""
         if self._state == PipelineState.EOF:
             raise RuntimeError("Cannot process block: pipeline is at EOF. Call reset() to restart.")
@@ -371,14 +388,16 @@ class StreamingCapturePipeline:
                 dtype=getattr(self._stream_info, "dtype", "complex64"),
             )
 
+        self._received_end_sample = block.end_sample
+        if self._noise_admission_sample is None:
+            self._noise_admission_sample = block.start_sample
+
         if block.dropped_samples_before > 0 or block.overflow:
             if is_calibrating and hasattr(self._noise_estimator, "suspend_training"):
                 self._noise_estimator.suspend_training()
 
-            # Write any residual from before the gap into ring buffer before handling discontinuity
-            if len(self._input_residual_iq) > 0:
-                self._ring.write(self._input_residual_start, self._input_residual_iq)
-                self._input_residual_iq = np.empty(0, dtype=np.complex64)
+            # Evaluate the old generation through the same path used at EOF.
+            emitted.extend(self._drain_input_residual())
 
             # Discontinuity: terminate in-flight capture
             discont_sidecar = self._assembler.handle_discontinuity(
@@ -403,7 +422,7 @@ class StreamingCapturePipeline:
             self._ring.reset(start_sample=block.start_sample)
             self._segmenter.reset()
             self._pending_noise_buf = np.empty(0, dtype=np.complex64)
-            self._pending_noise_iq.clear()
+            self._pending_noise_iq = ()
             self._noise_admission_sample = block.start_sample
             self._input_residual_iq = np.empty(0, dtype=np.complex64)
 
@@ -421,7 +440,9 @@ class StreamingCapturePipeline:
 
             # During warmup, consume only authorized prefix without filtering future suffix (D03)
             needed = len(block.iq)
-            if hasattr(self._noise_estimator, "_target_warmup_samples"):
+            if hasattr(self._noise_estimator, "remaining_warmup_samples"):
+                needed = min(needed, self._noise_estimator.remaining_warmup_samples)
+            elif hasattr(self._noise_estimator, "_target_warmup_samples"):
                 collected = getattr(self._noise_estimator, "_warmup_samples_collected", 0)
                 needed = min(len(block.iq), max(0, self._noise_estimator._target_warmup_samples - collected))
             elif hasattr(self._noise_estimator, "_warmup_samples"):
@@ -429,6 +450,10 @@ class StreamingCapturePipeline:
                 needed = min(len(block.iq), max(0, self._noise_estimator._warmup_samples - collected))
 
             warmup_slice = block.iq[:needed]
+            # Authorized training really traverses this path; bind its identity,
+            # rather than inferring compatibility from a similar mean power.
+            if hasattr(self._noise_estimator, "reference_domain"):
+                self._noise_estimator.reference_domain = self._detector.reference_domain
             cal_iq = self._detector.prepare_detection_iq(warmup_slice) if self._detector.mode == "configured_band" else warmup_slice
 
             consumed = 0
@@ -448,6 +473,7 @@ class StreamingCapturePipeline:
                 consumed = len(warmup_slice)
 
             self._ring.write(block.start_sample, block.iq[:consumed])
+            self._noise_admission_sample = block.start_sample + consumed
 
             still_calibrating = False
             if hasattr(self._noise_estimator, "state"):
@@ -470,7 +496,8 @@ class StreamingCapturePipeline:
                 overflow=False,
             )
 
-        self._previous_block = block
+        if self._noise_admission_sample is None:
+            self._noise_admission_sample = block.start_sample
 
         # Combine block with preceding input residual (C01 / C02)
         if len(self._input_residual_iq) > 0:
@@ -482,6 +509,7 @@ class StreamingCapturePipeline:
 
         hop_size = self._detector.hop_size
         num_hops = len(combined_iq) // hop_size
+        self._input_residual_iq = np.empty(0, dtype=np.complex64)
 
         for h_idx in range(num_hops):
             h_start = h_idx * hop_size
@@ -489,273 +517,189 @@ class StreamingCapturePipeline:
             hop_iq = combined_iq[h_start:h_end]
             hop_start_sample = combined_start + h_start
 
-            # Check noise estimator status at logical hop coordinate (B06 / C01 / D04)
-            if hasattr(self._noise_estimator, "state"):
-                est_state = self._noise_estimator.state
-                if est_state == NoiseLifecycleState.UNCALIBRATED:
-                    self._state = PipelineState.FAULTED
-                    raise UncalibratedNoiseError("Cannot process block: noise estimator is uncalibrated")
-                elif est_state == NoiseLifecycleState.STALE:
-                    self._state = PipelineState.FAULTED
-                    raise UncalibratedNoiseError("Cannot process block: noise estimator is stale")
-                elif est_state == NoiseLifecycleState.INVALID:
-                    self._state = PipelineState.FAULTED
-                    raise UncalibratedNoiseError("Cannot process block: noise estimator is invalid")
-
-            self._ring.write(hop_start_sample, hop_iq)
-
             hop_block = IQBlock(
-                stream=block.stream,
-                sequence_number=block.sequence_number,
-                start_sample=hop_start_sample,
-                timestamp_ns=None,
-                iq=hop_iq,
-                dropped_samples_before=0,
-                overflow=False,
+                stream=block.stream, sequence_number=block.sequence_number,
+                start_sample=hop_start_sample, timestamp_ns=None, iq=hop_iq,
             )
-
-            if hasattr(self._noise_estimator, "get_estimate"):
-                noise_est = self._noise_estimator.get_estimate(block.stream.stream_id, block.sequence_number)
-            else:
-                noise_est = self._noise_estimator.update(hop_block)
-
-            measurements = self._detector.process_windows(hop_block, noise_est)
-
-            det_iq = self._detector.last_detection_iq if self._detector.mode == "configured_band" else hop_iq
-            self._pending_noise_iq.append(det_iq)
-            if len(self._pending_noise_buf) == 0:
-                self._pending_noise_buf = det_iq.copy()
-            else:
-                self._pending_noise_buf = np.concatenate([self._pending_noise_buf, det_iq])
-
-            for meas in measurements:
-                horizon = meas.end_sample
-
-                if self._assembler.is_in_flight:
-                    self._assembler.update_active(horizon)
-
-                target_end = self._assembler.target_end_sample
-                if self._assembler.is_in_flight and target_end is not None:
-                    if target_end < horizon:
-                        sidecar = self._assembler.check_finalization()
-                        if sidecar is not None:
-                            self._segmenter.finish_event()
-                            analyzed = self._dispatch_event(sidecar)
-                            emitted.append(analyzed)
-                    elif target_end == horizon and not meas.above_on_threshold:
-                        sidecar = self._assembler.check_finalization()
-                        if sidecar is not None:
-                            self._segmenter.finish_event()
-                            analyzed = self._dispatch_event(sidecar)
-                            emitted.append(analyzed)
-
-                is_active_or_candidate = (
-                    self._segmenter.state != SegmentState.IDLE
-                    or meas.above_on_threshold
-                    or self._segmenter._on_count > 0
-                )
-
-                if hasattr(self._noise_estimator, "freeze"):
-                    self._noise_estimator.freeze(is_active_or_candidate)
-
-                prev_state = self._segmenter.state
-                decision = self._segmenter.update(meas)
-
-                if prev_state == SegmentState.POST_TRIGGER and decision.state == SegmentState.ACTIVE:
-                    self._assembler.reopen()
-
-                if decision.transition == SegmentTransition.START:
-                    assert self._segmenter.first_on_sample is not None
-                    assert self._segmenter.confirmation_sample is not None
-                    assert self._segmenter.trigger_sample is not None
-                    assert self._segmenter.detected_start_sample is not None
-
-                    self._assembler.start_capture(
-                        stream_info=block.stream,
-                        first_on_sample=self._segmenter.first_on_sample,
-                        confirmation_sample=self._segmenter.confirmation_sample,
-                        trigger_sample=self._segmenter.trigger_sample,
-                        detected_start_sample=self._segmenter.detected_start_sample,
-                        detector_mode=self._detector.mode,
-                        monitored_band_hz=self._detector.monitored_band_hz,
-                        noise_provenance=type(self._noise_estimator).__name__,
-                        noise_valid=noise_est.valid,
-                        boundary_uncertainty=None,
-                        decision_horizon=horizon,
-                    )
-                elif decision.transition == SegmentTransition.END:
-                    assert self._segmenter.detected_end_sample is not None
-                    assert self._segmenter.end_confirmation_sample is not None
-                    self._assembler.end_capture(
-                        detected_end_sample=self._segmenter.detected_end_sample,
-                        end_confirmation_sample=self._segmenter.end_confirmation_sample,
-                    )
-
-                if (
-                    self._assembler.is_in_flight
-                    and self._assembler.target_end_sample is not None
-                    and horizon >= self._assembler.target_end_sample
-                ):
-                    sidecar = self._assembler.check_finalization()
-                    if sidecar is not None:
-                        self._segmenter.finish_event()
-                        analyzed = self._dispatch_event(sidecar)
-                        emitted.append(analyzed)
-
-                # Exact causal noise admission up to decision horizon (D01)
-                count = min(len(self._pending_noise_buf), max(0, horizon - self._noise_admission_sample))
-                if count > 0:
-                    chunk = self._pending_noise_buf[:count]
-                    self._pending_noise_buf = self._pending_noise_buf[count:]
-                    self._noise_admission_sample += count
-                    if is_active_or_candidate:
-                        if hasattr(self._noise_estimator, "advance_stream_samples"):
-                            self._noise_estimator.advance_stream_samples(count)
-                    else:
-                        if hasattr(self._noise_estimator, "update_samples"):
-                            self._noise_estimator.update_samples(chunk)
-
+            emitted.extend(self._process_detection_chunk(hop_block))
 
         # Update input residual for remaining samples
         rem_offset = num_hops * hop_size
         if rem_offset < len(combined_iq):
-            self._input_residual_iq = combined_iq[rem_offset:]
+            self._input_residual_iq = combined_iq[rem_offset:].copy()
             self._input_residual_start = combined_start + rem_offset
         else:
             self._input_residual_iq = np.empty(0, dtype=np.complex64)
             self._input_residual_start = combined_start + len(combined_iq)
 
+        self._previous_block = block
+        self._sync_pending_age()
         return emitted
 
-    def flush(self) -> list[CaptureSidecar]:
-        """Flush pipeline at stream EOF. Evaluates any complete real windows before finalization (D02)."""
-        emitted: list[CaptureSidecar] = []
-        if self._state == PipelineState.EOF:
-            return emitted
+    @property
+    def consumed_end_sample(self) -> int:
+        """Exclusive raw commit horizon; inspect after a FAULTED partial block."""
+        return self._ring.next_write_sample
 
-        if len(self._input_residual_iq) > 0:
-            res_iq = self._input_residual_iq
-            res_start = self._input_residual_start
-            self._input_residual_iq = np.empty(0, dtype=np.complex64)
-            self._ring.write(res_start, res_iq)
+    @property
+    def received_end_sample(self) -> int | None:
+        """End of the most recently admitted transport block, including unprocessed suffix."""
+        return self._received_end_sample
 
-            res_block = IQBlock(
-                stream=self._stream_info,
-                sequence_number=(self._previous_block.sequence_number + 1) if self._previous_block is not None else 0,
-                start_sample=res_start,
-                timestamp_ns=None,
-                iq=res_iq,
-                dropped_samples_before=0,
-                overflow=False,
+    def _sync_pending_age(self) -> None:
+        if hasattr(self._noise_estimator, "set_pending_samples"):
+            self._noise_estimator.set_pending_samples(
+                len(self._pending_noise_buf) + len(self._input_residual_iq)
             )
 
+    def _process_detection_chunk(self, block: IQBlock) -> list[CaptureSidecar]:
+        """One chronological chunk, shared by transport, EOF and discontinuity."""
+        emitted: list[CaptureSidecar] = []
+        try:
+            if getattr(self._noise_estimator, "state", None) == NoiseLifecycleState.STALE:
+                raise UncalibratedNoiseError("Cannot process block: noise estimator is stale")
             if hasattr(self._noise_estimator, "get_estimate"):
-                noise_est = self._noise_estimator.get_estimate(self._stream_info.stream_id, res_block.sequence_number)
-            else:
-                noise_est = self._noise_estimator.update(res_block)
-
-            measurements = self._detector.process_windows(res_block, noise_est)
-
-            det_iq = self._detector.last_detection_iq if self._detector.mode == "configured_band" else res_iq
-            self._pending_noise_iq.append(det_iq)
-            if len(self._pending_noise_buf) == 0:
-                self._pending_noise_buf = det_iq.copy()
-            else:
-                self._pending_noise_buf = np.concatenate([self._pending_noise_buf, det_iq])
-
-            for meas in measurements:
-                horizon = meas.end_sample
-
-                if self._assembler.is_in_flight:
-                    self._assembler.update_active(horizon)
-
-                target_end = self._assembler.target_end_sample
-                if self._assembler.is_in_flight and target_end is not None:
-                    if target_end < horizon or (target_end == horizon and not meas.above_on_threshold):
-                        sidecar = self._assembler.check_finalization()
-                        if sidecar is not None:
-                            self._segmenter.finish_event()
-                            analyzed = self._dispatch_event(sidecar)
-                            emitted.append(analyzed)
-
-                is_active_or_candidate = (
-                    self._segmenter.state != SegmentState.IDLE
-                    or meas.above_on_threshold
-                    or self._segmenter._on_count > 0
+                noise_est = self._noise_estimator.get_estimate(
+                    block.stream.stream_id, block.sequence_number
                 )
+            else:
+                noise_est = self._noise_estimator.update(block)
+            # Detector validates prerequisites before filter mutation. Commit raw IQ only
+            # after detection succeeds; any subsequent failure requires explicit reset.
+            measurements = self._detector.process_windows(block, noise_est)
+            self._ring.write(block.start_sample, block.iq)
+        except Exception:
+            self._state = PipelineState.FAULTED
+            raise
 
-                if hasattr(self._noise_estimator, "freeze"):
-                    self._noise_estimator.freeze(is_active_or_candidate)
+        det_iq = self._detector.last_detection_iq if self._detector.mode == "configured_band" else block.iq
+        self._pending_noise_buf = np.concatenate([self._pending_noise_buf, det_iq])
+        if hasattr(self._noise_estimator, "set_pending_samples"):
+            self._noise_estimator.set_pending_samples(0)
 
-                prev_state = self._segmenter.state
-                decision = self._segmenter.update(meas)
+        for meas in measurements:
+            horizon = meas.end_sample
 
-                if prev_state == SegmentState.POST_TRIGGER and decision.state == SegmentState.ACTIVE:
-                    self._assembler.reopen()
+            if self._assembler.is_in_flight:
+                self._assembler.update_active(horizon)
 
-                if decision.transition == SegmentTransition.START:
-                    assert self._segmenter.first_on_sample is not None
-                    assert self._segmenter.confirmation_sample is not None
-                    assert self._segmenter.trigger_sample is not None
-                    assert self._segmenter.detected_start_sample is not None
-
-                    self._assembler.start_capture(
-                        stream_info=res_block.stream,
-                        first_on_sample=self._segmenter.first_on_sample,
-                        confirmation_sample=self._segmenter.confirmation_sample,
-                        trigger_sample=self._segmenter.trigger_sample,
-                        detected_start_sample=self._segmenter.detected_start_sample,
-                        detector_mode=self._detector.mode,
-                        monitored_band_hz=self._detector.monitored_band_hz,
-                        noise_provenance=type(self._noise_estimator).__name__,
-                        noise_valid=noise_est.valid,
-                        boundary_uncertainty=None,
-                        decision_horizon=horizon,
-                    )
-                elif decision.transition == SegmentTransition.END:
-                    assert self._segmenter.detected_end_sample is not None
-                    assert self._segmenter.end_confirmation_sample is not None
-                    self._assembler.end_capture(
-                        detected_end_sample=self._segmenter.detected_end_sample,
-                        end_confirmation_sample=self._segmenter.end_confirmation_sample,
-                    )
-
-                if (
-                    self._assembler.is_in_flight
-                    and self._assembler.target_end_sample is not None
-                    and horizon >= self._assembler.target_end_sample
-                ):
+            target_end = self._assembler.target_end_sample
+            if self._assembler.is_in_flight and target_end is not None:
+                if target_end < horizon:
+                    sidecar = self._assembler.check_finalization()
+                    if sidecar is not None:
+                        self._segmenter.finish_event()
+                        analyzed = self._dispatch_event(sidecar)
+                        emitted.append(analyzed)
+                elif target_end == horizon and not meas.above_on_threshold:
                     sidecar = self._assembler.check_finalization()
                     if sidecar is not None:
                         self._segmenter.finish_event()
                         analyzed = self._dispatch_event(sidecar)
                         emitted.append(analyzed)
 
-                count = min(len(self._pending_noise_buf), max(0, horizon - self._noise_admission_sample))
-                if count > 0:
-                    chunk = self._pending_noise_buf[:count]
-                    self._pending_noise_buf = self._pending_noise_buf[count:]
-                    self._noise_admission_sample += count
-                    if is_active_or_candidate:
-                        if hasattr(self._noise_estimator, "advance_stream_samples"):
-                            self._noise_estimator.advance_stream_samples(count)
-                    else:
-                        if hasattr(self._noise_estimator, "update_samples"):
-                            self._noise_estimator.update_samples(chunk)
+            is_active_or_candidate = (
+                self._segmenter.state != SegmentState.IDLE
+                or meas.above_on_threshold
+                or self._segmenter._on_count > 0
+            )
 
+            if hasattr(self._noise_estimator, "freeze"):
+                self._noise_estimator.freeze(is_active_or_candidate)
+
+            prev_state = self._segmenter.state
+            decision = self._segmenter.update(meas)
+
+            if prev_state == SegmentState.POST_TRIGGER and decision.state == SegmentState.ACTIVE:
+                self._assembler.reopen()
+
+            if decision.transition == SegmentTransition.START:
+                assert self._segmenter.first_on_sample is not None
+                assert self._segmenter.confirmation_sample is not None
+                assert self._segmenter.trigger_sample is not None
+                assert self._segmenter.detected_start_sample is not None
+
+                self._assembler.start_capture(
+                    stream_info=block.stream,
+                    first_on_sample=self._segmenter.first_on_sample,
+                    confirmation_sample=self._segmenter.confirmation_sample,
+                    trigger_sample=self._segmenter.trigger_sample,
+                    detected_start_sample=self._segmenter.detected_start_sample,
+                    detector_mode=self._detector.mode,
+                    monitored_band_hz=self._detector.monitored_band_hz,
+                    noise_provenance=type(self._noise_estimator).__name__,
+                    noise_valid=noise_est.valid,
+                    boundary_uncertainty=None,
+                    decision_horizon=horizon,
+                )
+            elif decision.transition == SegmentTransition.END:
+                assert self._segmenter.detected_end_sample is not None
+                assert self._segmenter.end_confirmation_sample is not None
+                self._assembler.end_capture(
+                    detected_end_sample=self._segmenter.detected_end_sample,
+                    end_confirmation_sample=self._segmenter.end_confirmation_sample,
+                )
+
+            if (
+                self._assembler.is_in_flight
+                and self._assembler.target_end_sample is not None
+                and horizon >= self._assembler.target_end_sample
+            ):
+                sidecar = self._assembler.check_finalization()
+                if sidecar is not None:
+                    self._segmenter.finish_event()
+                    analyzed = self._dispatch_event(sidecar)
+                    emitted.append(analyzed)
+
+            # Exact causal noise admission up to decision horizon (D01)
+            count = min(len(self._pending_noise_buf), max(0, horizon - self._noise_admission_sample))
+            if count > 0:
+                chunk = self._pending_noise_buf[:count]
+                self._pending_noise_buf = self._pending_noise_buf[count:].copy()
+                self._noise_admission_sample += count
+                if is_active_or_candidate:
+                    if hasattr(self._noise_estimator, "advance_stream_samples"):
+                        self._noise_estimator.advance_stream_samples(count)
+                else:
+                    if hasattr(self._noise_estimator, "update_samples"):
+                        self._noise_estimator.update_samples(chunk)
+        self._sync_pending_age()
+        return emitted
+
+    def _drain_input_residual(self) -> list[CaptureSidecar]:
+        if len(self._input_residual_iq) == 0:
+            return []
+        block = IQBlock(
+            stream=self._stream_info,
+            sequence_number=self._previous_block.sequence_number if self._previous_block else 0,
+            start_sample=self._input_residual_start, timestamp_ns=None,
+            iq=self._input_residual_iq,
+        )
+        self._input_residual_iq = np.empty(0, dtype=np.complex64)
+        return self._process_detection_chunk(block)
+
+    def flush(self) -> list[CaptureSidecar]:
+        """Evaluate complete real windows and finalize the contiguous received prefix."""
+        emitted: list[CaptureSidecar] = []
+        if self._state == PipelineState.EOF:
+            return emitted
+        faulted = self._state == PipelineState.FAULTED
+        if not faulted:
+            emitted.extend(self._drain_input_residual())
+        if hasattr(self._noise_estimator, "set_pending_samples"):
+            self._noise_estimator.set_pending_samples(0)
         leftover = len(self._pending_noise_buf)
-        if leftover > 0 and hasattr(self._noise_estimator, "advance_stream_samples"):
+        if leftover and hasattr(self._noise_estimator, "advance_stream_samples"):
             self._noise_estimator.advance_stream_samples(leftover)
-            self._pending_noise_buf = np.empty(0, dtype=np.complex64)
-
+        self._pending_noise_buf = np.empty(0, dtype=np.complex64)
         if self._assembler.is_in_flight:
-            eof_sidecar = self._assembler.flush_eof()
-            if eof_sidecar is not None:
+            sidecar = (self._assembler.handle_discontinuity(overflow=True) if faulted
+                       else self._assembler.flush_eof())
+            if sidecar is not None:
                 self._segmenter.finish_event()
-                analyzed = self._dispatch_event(eof_sidecar)
-                emitted.append(analyzed)
-
-        self._state = PipelineState.EOF
+                emitted.append(self._dispatch_event(sidecar))
+        if not faulted:
+            self._state = PipelineState.EOF
         return emitted
 
     finalize = flush
@@ -770,9 +714,10 @@ class StreamingCapturePipeline:
         self._assembler.reset()
         self._worker.reset()
         self._previous_block = None
-        self._noise_admission_sample = 0
+        self._received_end_sample = None
+        self._noise_admission_sample = None
         self._pending_noise_buf = np.empty(0, dtype=np.complex64)
-        self._pending_noise_iq.clear()
+        self._pending_noise_iq = ()
         self._input_residual_iq = np.empty(0, dtype=np.complex64)
         self._input_residual_start = 0
 

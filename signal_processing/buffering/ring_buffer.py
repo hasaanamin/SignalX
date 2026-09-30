@@ -154,6 +154,9 @@ class CircularIQBuffer:
             BufferOverwrittenError: If start_sample < oldest_sample.
             BufferUnavailableError: If end_sample > next_write_sample.
         """
+        for name, value in (("start_sample", start_sample), ("end_sample", end_sample)):
+            if isinstance(value, bool) or not isinstance(value, (int, np.integer)) or value < 0:
+                raise BufferRangeError(f"{name} must be an integer >= 0, got {value!r}")
         start = int(start_sample)
         end = int(end_sample)
         if start > end:
@@ -193,6 +196,8 @@ class CircularIQBuffer:
         Args:
             start_sample: Initial sample coordinate for the new generation.
         """
+        if isinstance(start_sample, bool) or not isinstance(start_sample, (int, np.integer)) or start_sample < 0:
+            raise ValueError(f"start_sample must be an integer >= 0, got {start_sample!r}")
         with self._lock:
             self._stream_generation += 1
             self._oldest_sample = int(start_sample)

@@ -57,7 +57,7 @@ class TestContextIntegration:
 
         assert isinstance(fset, FeatureSet)
         assert fset.extractor == "bandwidth"
-        assert fset.extractor_version == "1.0"
+        assert fset.extractor_version == "2.0"
         assert len(fset.features) == 2
 
         obw = fset.features["bandwidth.occupied_99_hz"]
