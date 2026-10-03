@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "signal-processing"
-version = "2.1.0"
+version = "2.2.0"
 description = "Modular real-time RF signal processing and feature extraction library for LTE-targeted SDR pipelines"
 readme = "README.md"
 requires-python = ">=3.10"

@@ -153,7 +153,7 @@ def run_latency_and_throughput_benchmarks() -> dict:
     print(f"  Latency p50:          {cap_p50:.3f} ms / block")
     print(f"  Latency p95:          {cap_p95:.3f} ms / block")
     print(f"  Latency p99:          {cap_p99:.3f} ms / block")
-    print(f"  Real-time achieved:   {'YES (Substantial headroom)' if cap_p99 < 1.024 else 'Marginal'}")
+    print("  Unpaced measurements do not establish scheduled real-time acceptance.")
 
     print("\nUnpaced Full Pipeline (Capture + Synchronous 56-Feature Extraction):")
     print(f"  Events Captured:      {len(full_events)}")
@@ -164,7 +164,7 @@ def run_latency_and_throughput_benchmarks() -> dict:
     print(f"  Latency p50:          {full_p50:.3f} ms / block")
     print(f"  Latency p95:          {full_p95:.3f} ms / block")
     print(f"  Latency p99:          {full_p99:.3f} ms / block")
-    print(f"  Real-time achieved:   {'YES' if full_thp > 1.0 else 'NO (Slower than real-time; asynchronous worker recommended)'}")
+    print("  Scheduled acquisition and required delivery are evaluated separately below.")
 
     return {
         "env": env_info,
@@ -189,8 +189,13 @@ def run_paced_stress_benchmark(duration_seconds: float = 5.0, **kwargs) -> dict:
           f"lost samples={result['dropped_samples']}; "
           f"queue peak={result['acquisition_queue_peak']}/{result['queue_capacity']}; "
           f"recovered={result['recovered']}")
-    print("PASS" if result["passed"] else "FAIL: host did not meet acquisition deadlines/loss criteria")
+    print("PASS" if result["passed"] else "FAIL: one or more required acquisition/capture/delivery/recovery stages failed")
     return result
+
+
+def acceptance_exit_code(result: dict, enforce: bool) -> int:
+    """Enforce the declared aggregate scope, including mandatory delivery."""
+    return int(enforce and not result.get('passed', False))
 
 
 def main() -> None:
@@ -222,8 +227,8 @@ def main() -> None:
     print("ALL EVALUATIONS AND BENCHMARKS COMPLETED")
     print("=" * 80)
 
-    if args.enforce_acceptance and not stress_results.get("passed", False):
-        print("FAIL: Enforce acceptance failed (real-time deadlines missed or queue drops occurred)")
+    if acceptance_exit_code(stress_results, args.enforce_acceptance):
+        print("FAIL: Enforce acceptance failed (see individual acquisition/capture/delivery/recovery outcomes)")
         sys.exit(1)
 
 

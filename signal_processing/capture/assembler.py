@@ -268,7 +268,7 @@ class EventAssembler:
         return None
 
     def handle_discontinuity(
-        self, dropped_samples: int = 0, overflow: bool = False
+        self, dropped_samples: int = 0, overflow: bool = False, *, reason: str = "discontinuity"
     ) -> CaptureSidecar | None:
         """Terminate active capture early due to stream discontinuity / dropped samples."""
         if not self._in_flight:
@@ -288,7 +288,7 @@ class EventAssembler:
             self.update_active(target)
 
         return self._build_event_and_sidecar(
-            termination_reason="discontinuity",
+            termination_reason=reason,
             is_truncated=True,
         )
 

@@ -379,6 +379,22 @@ class IQBlock:
         frozen_iq = _validate_and_freeze_iq_array(self.iq, "iq")
         object.__setattr__(self, "iq", frozen_iq)
 
+    def slice_received(self, start: int, end: int) -> IQBlock:
+        """Immutable sub-block view; no second IQ copy or validation of already frozen samples.
+
+        Coordinates are local, half-open and nonempty. Loss markers belong to the
+        original transport block and are not propagated into internal subdivisions.
+        Timestamp is omitted; the pipeline retains its original absolute anchor.
+        """
+        if type(start) is not int or type(end) is not int or not 0 <= start < end <= len(self.iq):
+            raise ContractValidationError("Invalid received sub-block range")
+        result = object.__new__(IQBlock)
+        for name, value in (('stream', self.stream), ('sequence_number', self.sequence_number),
+                            ('start_sample', self.start_sample+start), ('timestamp_ns', None),
+                            ('iq', self.iq[start:end]), ('dropped_samples_before', 0), ('overflow', False)):
+            object.__setattr__(result, name, value)
+        return result
+
     @property
     def num_samples(self) -> int:
         """Total number of IQ samples in this block."""
@@ -537,11 +553,23 @@ class DetectionMeasurement:
     off_threshold_dbfs: float
     above_on_threshold: bool
     below_off_threshold: bool
+    signal_power_linear: float | None = None
+    noise_power_linear: float | None = None
+    on_threshold_linear: float | None = None
+    off_threshold_linear: float | None = None
+    threshold_support_method: str = "model_only"
+    threshold_evidence_id: str | None = None
 
     def __post_init__(self) -> None:
         _validate_non_blank_str(self.stream_id, "stream_id")
         _validate_non_negative_int(self.block_sequence_number, "block_sequence_number")
         start = _validate_non_negative_int(self.start_sample, "start_sample")
+        if self.threshold_support_method not in ('model_only', 'uncertified_training_quantile', 'held_out_clopper_pearson_bonferroni'):
+            raise ContractValidationError("Unknown threshold support method")
+        if self.threshold_support_method == 'held_out_clopper_pearson_bonferroni':
+            _validate_non_blank_str(self.threshold_evidence_id, 'threshold_evidence_id')
+        elif self.threshold_evidence_id is not None:
+            raise ContractValidationError("Uncertified measurements cannot claim held-out evidence")
 
         if isinstance(self.end_sample, bool) or not isinstance(
             self.end_sample, (int, np.integer)
@@ -583,7 +611,24 @@ class DetectionMeasurement:
         if not isinstance(self.below_off_threshold, bool):
             raise ContractValidationError("Field 'below_off_threshold' must be a boolean")
 
-        expected_above = sig_pow >= on_th
+        physical = (self.signal_power_linear, self.noise_power_linear,
+                    self.on_threshold_linear, self.off_threshold_linear)
+        if any(x is not None for x in physical):
+            if any(x is None for x in physical):
+                raise ContractValidationError("Physical measurement fields must be supplied together")
+            for name, value in zip(('signal_power_linear', 'noise_power_linear', 'on_threshold_linear', 'off_threshold_linear'), physical):
+                _validate_finite_float(value, name)
+            power, noise, on, off = physical
+            if power < 0 or noise <= 0 or not 0 < off < on:
+                raise ContractValidationError("Invalid physical powers/threshold ordering")
+            for linear, db in ((power, sig_pow), (noise, self.noise_power_dbfs), (on, on_th), (off, off_th)):
+                # Zero power has a finite display-only sentinel. Its linear field
+                # is authoritative; positive powers always have truthful logarithms.
+                if linear > 0 and not math.isclose(10*math.log10(linear), db, rel_tol=0, abs_tol=1e-9):
+                    raise ContractValidationError("Physical power and logarithmic metadata contradict")
+            expected_above, expected_below = power >= on, power < off
+        else:
+            expected_above, expected_below = sig_pow >= on_th, sig_pow < off_th
         if self.above_on_threshold != expected_above:
             raise ContractValidationError(
                 f"Inconsistent above_on_threshold: signal_power_dbfs ({sig_pow}) "
@@ -591,7 +636,6 @@ class DetectionMeasurement:
                 f"expected above_on_threshold={expected_above}, got {self.above_on_threshold}"
             )
 
-        expected_below = sig_pow < off_th
         if self.below_off_threshold != expected_below:
             raise ContractValidationError(
                 f"Inconsistent below_off_threshold: signal_power_dbfs ({sig_pow}) "

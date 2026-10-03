@@ -73,6 +73,9 @@ class StreamingCapturePipeline:
         threshold_policy: ThresholdPolicy | None = None,
         gain_id: str = "digital_iq_unity",
         require_supported_pfa: bool = False,
+        max_completed_per_call: int = 128,
+        analysis_function=None,
+        result_delivery: str = "polling",
     ) -> None:
         if isinstance(window_size, bool) or not isinstance(window_size, (int, np.integer)) or window_size < 1:
             raise ValueError(f"window_size must be an integer >= 1, got {window_size!r}")
@@ -110,6 +113,10 @@ class StreamingCapturePipeline:
                 f"must be at least {min_event_extent} samples to span detector window/margins"
             )
 
+        if type(max_completed_per_call) is not int or max_completed_per_call < 1:
+            raise ValueError("max_completed_per_call must be a positive integer")
+        self._max_completed_per_call = max_completed_per_call
+        self._call_outputs: list[CaptureSidecar] | None = None
         self._stream_info = stream_info
         self._state = PipelineState.OPEN
 
@@ -175,6 +182,8 @@ class StreamingCapturePipeline:
             skip_incomplete_quality=skip_incomplete_quality,
             synchronous=synchronous_analysis,
             analysis_config=analysis_config,
+            analysis_function=analysis_function,
+            result_delivery=result_delivery,
         )
 
         self._enable_feature_analysis = bool(enable_feature_analysis)
@@ -189,6 +198,26 @@ class StreamingCapturePipeline:
 
     def _dispatch_event(self, sidecar: CaptureSidecar) -> CaptureSidecar:
         """Route finalized event through feature worker or return directly if feature analysis is disabled."""
+        # Record ownership BEFORE analysis submission: submission itself can fail.
+        index = len(self._call_outputs) if self._call_outputs is not None else None
+        if index is not None:
+            self._call_outputs.append(sidecar)
+            if len(self._call_outputs) >= self._max_completed_per_call:
+                self._call_outputs[index] = sidecar.with_features(features=None, feature_status="failed",
+                    feature_reason="Output capacity reached before analysis dispatch")
+                raise RuntimeError("Completed-capture limit reached; recover exception.completed_captures and reset")
+        try:
+            result = self._analyze_event(sidecar)
+        except Exception as exc:
+            if index is not None:
+                self._call_outputs[index] = sidecar.with_features(
+                    features=None, feature_status="failed", feature_reason=f"Analysis dispatch failed: {type(exc).__name__}: {exc}")
+            raise
+        if index is not None:
+            self._call_outputs[index] = result
+        return result
+
+    def _analyze_event(self, sidecar: CaptureSidecar) -> CaptureSidecar:
         if not self._enable_feature_analysis:
             return sidecar.with_features(
                 features=None,
@@ -230,15 +259,29 @@ class StreamingCapturePipeline:
         return self._worker
 
     def process_block(self, block: IQBlock) -> list[CaptureSidecar]:
+        """Return captures, or raise the original error with completed_captures.
+
+        The immutable exception tuple owns this call's completed raw outputs.
+        Feature callbacks/polling are analysis updates of the same event identity,
+        not additional raw events. No recovery queue is retained by the pipeline.
+        """
+        self._call_outputs = []
+        consumed_before = self.consumed_end_sample
         try:
             return self._process_block(block)
-        except StreamConsistencyError:
-            # Metadata validation is pre-commit and can be retried.
-            raise
-        except Exception:
-            if self._state != PipelineState.EOF:
+        except Exception as exc:
+            if self._state != PipelineState.EOF and (not isinstance(exc, StreamConsistencyError)
+                    or self.consumed_end_sample != consumed_before or self._call_outputs):
                 self._state = PipelineState.FAULTED
+            self._attach_recovery(exc)
             raise
+        finally:
+            self._call_outputs = None
+
+    def _attach_recovery(self, exc: Exception) -> None:
+        exc.completed_captures = tuple(self._call_outputs or ())
+        exc.consumed_end_sample = self.consumed_end_sample
+        exc.received_end_sample = self.received_end_sample
 
     def _process_block(self, block: IQBlock) -> list[CaptureSidecar]:
         """Process incoming IQBlock chunk through the streaming pipeline."""
@@ -418,7 +461,7 @@ class StreamingCapturePipeline:
             else:
                 self._noise_estimator.reset()
 
-            self._worker.advance_generation()
+            # Raw continuity changed; assembled immutable analysis jobs remain valid.
             self._ring.reset(start_sample=block.start_sample)
             self._segmenter.reset()
             self._pending_noise_buf = np.empty(0, dtype=np.complex64)
@@ -454,7 +497,8 @@ class StreamingCapturePipeline:
             # rather than inferring compatibility from a similar mean power.
             if hasattr(self._noise_estimator, "reference_domain"):
                 self._noise_estimator.reference_domain = self._detector.reference_domain
-            cal_iq = self._detector.prepare_detection_iq(warmup_slice) if self._detector.mode == "configured_band" else warmup_slice
+            cal_iq = self._detector.prepare_detection_iq(IQBlock(
+                block.stream, block.sequence_number, block.start_sample, block.timestamp_ns, warmup_slice))
 
             consumed = 0
             if hasattr(self._noise_estimator, "update_samples"):
@@ -503,9 +547,11 @@ class StreamingCapturePipeline:
         if len(self._input_residual_iq) > 0:
             combined_iq = np.concatenate([self._input_residual_iq, block.iq])
             combined_start = self._input_residual_start
+            combined_block = IQBlock(block.stream, block.sequence_number, combined_start, None, combined_iq)
         else:
             combined_iq = block.iq
             combined_start = block.start_sample
+            combined_block = block
 
         hop_size = self._detector.hop_size
         num_hops = len(combined_iq) // hop_size
@@ -514,13 +560,7 @@ class StreamingCapturePipeline:
         for h_idx in range(num_hops):
             h_start = h_idx * hop_size
             h_end = h_start + hop_size
-            hop_iq = combined_iq[h_start:h_end]
-            hop_start_sample = combined_start + h_start
-
-            hop_block = IQBlock(
-                stream=block.stream, sequence_number=block.sequence_number,
-                start_sample=hop_start_sample, timestamp_ns=None, iq=hop_iq,
-            )
+            hop_block = combined_block.slice_received(h_start, h_end)
             emitted.extend(self._process_detection_chunk(hop_block))
 
         # Update input residual for remaining samples
@@ -679,6 +719,17 @@ class StreamingCapturePipeline:
         return self._process_detection_chunk(block)
 
     def flush(self) -> list[CaptureSidecar]:
+        self._call_outputs = []
+        try:
+            return self._flush()
+        except Exception as exc:
+            self._state = PipelineState.FAULTED
+            self._attach_recovery(exc)
+            raise
+        finally:
+            self._call_outputs = None
+
+    def _flush(self) -> list[CaptureSidecar]:
         """Evaluate complete real windows and finalize the contiguous received prefix."""
         emitted: list[CaptureSidecar] = []
         if self._state == PipelineState.EOF:
@@ -693,7 +744,7 @@ class StreamingCapturePipeline:
             self._noise_estimator.advance_stream_samples(leftover)
         self._pending_noise_buf = np.empty(0, dtype=np.complex64)
         if self._assembler.is_in_flight:
-            sidecar = (self._assembler.handle_discontinuity(overflow=True) if faulted
+            sidecar = (self._assembler.handle_discontinuity(reason="processing_failure") if faulted
                        else self._assembler.flush_eof())
             if sidecar is not None:
                 self._segmenter.finish_event()

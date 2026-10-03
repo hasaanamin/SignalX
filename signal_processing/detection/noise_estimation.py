@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import enum
 import hashlib
+import json
 import math
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, replace
 from typing import Any, Literal
 
 import numpy as np
@@ -48,7 +49,7 @@ class ThresholdPolicy:
     filter_sos_hash: str | None = None
     training_samples: int = 0
     training_windows: int = 0
-    policy_version: str = "3.0"
+    policy_version: str = "4.0"
     valid: bool = True
     reason: str | None = None
     reference_domain: NoiseReferenceDomain | None = None
@@ -62,8 +63,70 @@ class ThresholdPolicy:
     pfa_upper_off: float | None = None
     evidence_id: str | None = None
     settling_samples: int = 0
+    statistic_version: str = "mean_squared_complex128_rectangular_v1"
+    validation_configuration_hash: str | None = None
+    validation_evidence_hash: str | None = None
+
+    @staticmethod
+    def _evidence_hash(data: dict) -> str:
+        fields = ('validation_configuration_hash', 'evidence_id', 'confidence_level',
+                  'dependence_assumption', 'validation_windows', 'validation_exceedances_on',
+                  'validation_exceedances_off', 'pfa_upper_on', 'pfa_upper_off', 'support_method')
+        return hashlib.sha256(json.dumps({k: data[k] for k in fields}, sort_keys=True,
+                              separators=(',', ':'), allow_nan=False).encode()).hexdigest()
+
+    def configuration_hash(self) -> str:
+        """Identity of the physical statistic actually validated, not of a certificate name."""
+        fields = ('mode', 'window_size', 'hop_size', 'pfa_on', 'pfa_off', 'mean_power_linear',
+                  't_on_linear', 't_off_linear', 'sample_rate_hz', 'monitored_band_hz',
+                  'filter_sos_hash', 'reference_domain', 'settling_samples', 'statistic_version', 'policy_version')
+        data = asdict(self)
+        return hashlib.sha256(json.dumps({k: data[k] for k in fields}, sort_keys=True,
+                              separators=(',', ':'), allow_nan=False).encode()).hexdigest()
+
+    def without_validation(self) -> ThresholdPolicy:
+        """Explicitly discard old evidence before changing/revalidating a policy."""
+        return replace(self, supported_pfa=False, support_method="uncertified", dependence_assumption="unspecified",
+                       confidence_level=None, validation_windows=0, validation_exceedances_on=0,
+                       validation_exceedances_off=0, pfa_upper_on=None, pfa_upper_off=None,
+                       evidence_id=None, validation_configuration_hash=None, validation_evidence_hash=None)
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: dict) -> ThresholdPolicy:
+        data = dict(data)
+        if data.get('monitored_band_hz') is not None:
+            data['monitored_band_hz'] = tuple(data['monitored_band_hz'])
+        domain = data.get('reference_domain')
+        if isinstance(domain, dict):
+            domain = dict(domain)
+            if domain.get('monitored_band_hz') is not None:
+                domain['monitored_band_hz'] = tuple(domain['monitored_band_hz'])
+            data['reference_domain'] = NoiseReferenceDomain(**domain)
+        return cls(**data)
 
     def __post_init__(self) -> None:
+        for name in ('validation_windows', 'validation_exceedances_on', 'validation_exceedances_off', 'settling_samples'):
+            value = getattr(self, name)
+            if type(value) is not int or value < 0:
+                raise ContractValidationError(f"{name} must be a nonnegative integer")
+        if not 0 <= self.validation_exceedances_on <= self.validation_exceedances_off <= self.validation_windows:
+            raise ContractValidationError("Impossible ordered exceedance counts")
+        for name in ('confidence_level', 'pfa_upper_on', 'pfa_upper_off'):
+            value = getattr(self, name)
+            if value is not None and (isinstance(value, bool) or not isinstance(value, (int, float))
+                                      or not math.isfinite(value) or not 0 <= value <= 1):
+                raise ContractValidationError(f"{name} must be a finite probability")
+        if self.reference_domain is not None and not isinstance(self.reference_domain, NoiseReferenceDomain):
+            raise ContractValidationError("reference_domain must be NoiseReferenceDomain")
+        if self.statistic_version != "mean_squared_complex128_rectangular_v1":
+            raise ContractValidationError("Unsupported statistic semantics")
+        if not isinstance(self.policy_version, str) or not self.policy_version.strip():
+            raise ContractValidationError("Invalid policy version")
+        if self.support_method not in ('uncertified', 'uncertified_training_quantile', 'held_out_clopper_pearson_bonferroni'):
+            raise ContractValidationError("Unknown support method")
         if type(self.valid) is not bool:
             raise ContractValidationError(f"valid must be a strict boolean, got {self.valid!r}")
         if type(self.supported_pfa) is not bool:
@@ -146,12 +209,20 @@ class ThresholdPolicy:
                                             self.filter_sos_hash, self.reference_domain.gain_id)
             if self.reference_domain != expected:
                 raise ContractValidationError("Reference domain contradicts policy path")
-        if self.mode == "empirical_matched" and self.supported_pfa and self.support_method != "held_out_clopper_pearson_bonferroni":
-            raise ContractValidationError("Empirical support requires explicit held-out confidence evidence")
+        if self.supported_pfa and self.support_method != "held_out_clopper_pearson_bonferroni":
+            raise ContractValidationError("Support requires explicit held-out confidence evidence")
+        if self.support_method != 'held_out_clopper_pearson_bonferroni' and (self.validation_configuration_hash is not None or self.validation_evidence_hash is not None or self.validation_windows
+                                                    or self.evidence_id is not None or self.confidence_level is not None
+                                                    or self.pfa_upper_on is not None or self.pfa_upper_off is not None):
+            raise ContractValidationError("Uncertified policies must not retain validation evidence; use without_validation()")
         if self.support_method == "held_out_clopper_pearson_bonferroni":
+            if self.reference_domain is None or self.validation_configuration_hash != self.configuration_hash():
+                raise ContractValidationError("Held-out evidence does not match the current thresholds/statistic/domain")
+            if self.validation_evidence_hash != self._evidence_hash(asdict(self)):
+                raise ContractValidationError("Held-out evidence metadata was edited without new validation")
             if self.confidence_level is None or not 0 < self.confidence_level < 1:
                 raise ContractValidationError("Invalid confidence level")
-            if self.validation_windows < 1 or not self.evidence_id:
+            if self.validation_windows < 1 or not isinstance(self.evidence_id, str) or not self.evidence_id.strip():
                 raise ContractValidationError("Held-out support requires evidence and independent windows")
             if self.dependence_assumption != "independent_held_out_windows":
                 raise ContractValidationError("Held-out support requires an explicit independence assumption")
@@ -197,12 +268,15 @@ class ThresholdPolicy:
         def upper(k: int) -> float:
             return 1.0 if k == n else float(beta.ppf(level, k + 1, n - k))
         u_on, u_off = upper(on), upper(off)
-        return replace(self, supported_pfa=u_on <= self.pfa_on and u_off <= self.pfa_off,
+        updates = dict(supported_pfa=u_on <= self.pfa_on and u_off <= self.pfa_off,
                        support_method="held_out_clopper_pearson_bonferroni",
                        dependence_assumption=independence_assumption, evidence_id=evidence_id,
                        confidence_level=confidence_level, validation_windows=n,
                        validation_exceedances_on=on, validation_exceedances_off=off,
-                       pfa_upper_on=u_on, pfa_upper_off=u_off)
+                       pfa_upper_on=u_on, pfa_upper_off=u_off,
+                       validation_configuration_hash=self.configuration_hash())
+        data = asdict(self); data.update(updates)
+        return replace(self, **updates, validation_evidence_hash=self._evidence_hash(data))
 
 
 class GaussianNoiseEstimator(NoiseEstimatorProtocol, Resettable):
@@ -344,8 +418,8 @@ class GaussianNoiseEstimator(NoiseEstimatorProtocol, Resettable):
     def get_thresholds_dbfs(self) -> tuple[float, float]:
         """Compute (T_on_dbfs, T_off_dbfs) in dBFS units."""
         t_on_lin, t_off_lin = self.get_thresholds_linear()
-        on_dbfs = 10.0 * math.log10(max(t_on_lin, self._conversion_floor))
-        off_dbfs = 10.0 * math.log10(max(t_off_lin, self._conversion_floor))
+        on_dbfs = 10.0 * math.log10(t_on_lin)
+        off_dbfs = 10.0 * math.log10(t_off_lin)
         return on_dbfs, off_dbfs
 
     @property
@@ -389,8 +463,12 @@ class GaussianNoiseEstimator(NoiseEstimatorProtocol, Resettable):
                 reason=reason,
             )
 
-        noise_dbfs = 10.0 * math.log10(max(self._noise_power_linear, self._conversion_floor))
-        return NoiseEstimate(
+        noise_dbfs = 10.0 * math.log10(self._noise_power_linear)
+        key = (sid, block_sequence_number, noise_dbfs, self.reference_domain, self._warmup_samples_collected)
+        cached = getattr(self, '_estimate_cache', None)
+        if cached is not None and cached[0] == key:
+            return cached[1]
+        estimate = NoiseEstimate(
             stream_id=sid,
             block_sequence_number=block_sequence_number,
             noise_power_dbfs=noise_dbfs,
@@ -399,6 +477,8 @@ class GaussianNoiseEstimator(NoiseEstimatorProtocol, Resettable):
             reference_domain=self.reference_domain,
             training_samples=self._warmup_samples_collected,
         )
+        self._estimate_cache = (key, estimate)  # One record, never recording-length history.
+        return estimate
 
     def update_samples(self, samples_iq: np.ndarray) -> int:
         """Ingest clean noise samples during warmup training up to the exact authorized budget.
@@ -439,8 +519,8 @@ class GaussianNoiseEstimator(NoiseEstimatorProtocol, Resettable):
                 total_p = self._warmup_power_sum
                 total_s = self._warmup_samples_collected
                 if total_s > 0:
-                    self._noise_power_linear = max(float(total_p / total_s), self._conversion_floor)
-                    self._state = NoiseLifecycleState.VALID
+                    self._noise_power_linear = float(total_p / total_s)
+                    self._state = NoiseLifecycleState.VALID if self._noise_power_linear > 0 else NoiseLifecycleState.INVALID
         return discarded + n_consume
 
     def suspend_training(self) -> None:
@@ -665,8 +745,8 @@ class AdaptiveRobustNoiseEstimator(NoiseEstimatorProtocol, Resettable):
 
     def get_thresholds_dbfs(self) -> tuple[float, float]:
         t_on_lin, t_off_lin = self.get_thresholds_linear()
-        on_dbfs = 10.0 * math.log10(max(t_on_lin, self._conversion_floor))
-        off_dbfs = 10.0 * math.log10(max(t_off_lin, self._conversion_floor))
+        on_dbfs = 10.0 * math.log10(t_on_lin)
+        off_dbfs = 10.0 * math.log10(t_off_lin)
         return on_dbfs, off_dbfs
 
     def get_estimate(self, stream_id: str = "default", block_sequence_number: int = 0) -> NoiseEstimate:
@@ -686,7 +766,7 @@ class AdaptiveRobustNoiseEstimator(NoiseEstimatorProtocol, Resettable):
                 reason=reason,
             )
 
-        noise_dbfs = 10.0 * math.log10(max(self._noise_power_linear, self._conversion_floor))
+        noise_dbfs = 10.0 * math.log10(self._noise_power_linear)
         return NoiseEstimate(
             stream_id=sid,
             block_sequence_number=block_sequence_number,
@@ -1134,10 +1214,10 @@ class EmpiricalNoiseCalibrator:
         t_on_dbfs = 10.0 * math.log10(t_on_lin)
         t_off_dbfs = 10.0 * math.log10(t_off_lin)
 
-        # Enforce strict invariant: on > off
+        # Equal empirical quantiles contain no resolved hysteresis; do not invent
+        # a percentage adjustment and call it a measured threshold.
         if t_on_lin <= t_off_lin:
-            t_on_lin = t_off_lin * 1.01
-            t_on_dbfs = 10.0 * math.log10(t_on_lin)
+            raise ValueError("Training quantiles do not resolve strictly ordered ON/OFF thresholds")
 
         return ThresholdPolicy(
             mode=mode,

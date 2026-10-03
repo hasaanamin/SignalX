@@ -13,4 +13,4 @@ Iteration foundational packages:
     signal_processing.runtime
 """
 
-__version__ = "2.1.0"
+__version__ = "2.2.0"

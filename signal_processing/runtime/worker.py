@@ -7,6 +7,7 @@ import dataclasses
 import enum
 import queue
 import threading
+import time
 from collections.abc import Callable
 from typing import Any
 
@@ -43,6 +44,8 @@ class FeatureAnalysisWorker:
         synchronous: bool = True,
         analysis_config: AnalysisConfig | None = None,
         result_sink: Callable[[CaptureSidecar], None] | None = None,
+        analysis_function: Callable[[SignalContext], AnalysisResult] | None = None,
+        result_delivery: str = "polling",
     ) -> None:
         if isinstance(max_queue_size, bool) or not isinstance(max_queue_size, int) or max_queue_size < 1:
             raise ValueError(f"max_queue_size must be an integer >= 1, got {max_queue_size!r}")
@@ -51,10 +54,16 @@ class FeatureAnalysisWorker:
 
         self._max_queue_size = int(max_queue_size)
         self._max_results = int(max_results)
+        if result_delivery not in ('polling', 'callbacks'):
+            raise ValueError("result_delivery must be polling or callbacks")
+        self._result_delivery = result_delivery
+        self._polling_reserved = 0
         self._skip_incomplete_quality = bool(skip_incomplete_quality)
         self._synchronous = bool(synchronous)
         self._analysis_config = analysis_config
         self._result_sink = result_sink
+        self._analysis_function = analysis_function
+        self._cancellation_operations = 0
         self._result_sinks: list[Callable[[CaptureSidecar], None]] = (
             [result_sink] if result_sink is not None else []
         )
@@ -71,6 +80,8 @@ class FeatureAnalysisWorker:
         self._failed_count: int = 0
         self._discarded_old_generation_count: int = 0
         self._sink_error_count: int = 0
+        self.analysis_seconds = 0.0
+        self.sink_seconds = 0.0
         self._processed_results: collections.deque[CaptureSidecar] = collections.deque(maxlen=self._max_results)
         self._lock = threading.Lock()
         self._sentinel_enqueued: bool = False
@@ -116,6 +127,12 @@ class FeatureAnalysisWorker:
             return self._cancelled_count
 
     @property
+    def cancellation_operations(self) -> int:
+        """Lifetime explicit cancellation barriers, not reset with per-generation counters."""
+        with self._lock:
+            return self._cancellation_operations
+
+    @property
     def completed_count(self) -> int:
         with self._lock:
             return self._completed_count
@@ -148,10 +165,11 @@ class FeatureAnalysisWorker:
             return False
 
         self._processed_results.append(result)
-        try:
-            self._result_queue.put_nowait(result)
-        except queue.Full:
-            self._dropped_result_overload_count += 1
+        if self._result_delivery == 'polling':
+            try:
+                self._result_queue.put_nowait(result)
+            except queue.Full:
+                self._dropped_result_overload_count += 1
 
         if result.feature_status == "failed":
             self._failed_count += 1
@@ -184,13 +202,19 @@ class FeatureAnalysisWorker:
                     self._discarded_old_generation_count += 1
                     return
             try:
+                started = time.perf_counter()
                 sink(result)
             except Exception:
                 with self._lock:
                     self._sink_error_count += 1
+            finally:
+                with self._lock:
+                    self.sink_seconds += time.perf_counter() - started
 
     def get_result(self, block: bool = True, timeout: float | None = None) -> CaptureSidecar | None:
         """Retrieve the next processed result from the result delivery queue."""
+        if self._result_delivery != 'polling':
+            raise RuntimeError("This worker declares callbacks, not polling, as its delivery channel")
         import time
         deadline = None if timeout is None else time.monotonic() + timeout
         while True:
@@ -202,6 +226,8 @@ class FeatureAnalysisWorker:
             with self._lock:
                 generation = getattr(result, "processing_generation", None)
                 if generation is None or generation == self._current_generation:
+                    if not self._synchronous:
+                        self._polling_reserved -= 1
                     return result
                 self._discarded_old_generation_count += 1
 
@@ -248,7 +274,10 @@ class FeatureAnalysisWorker:
             context = SignalContext(
                 event=sidecar.event, config=self._analysis_config, capture_quality=cap_quality
             )
-            analysis_result: AnalysisResult = self._aggregator.extract_analysis_result(context)
+            analysis_result: AnalysisResult = (self._analysis_function(context) if self._analysis_function is not None
+                                               else self._aggregator.extract_analysis_result(context))
+            if not isinstance(analysis_result, AnalysisResult):
+                raise TypeError("analysis_function must return AnalysisResult")
             if not sidecar.event.complete:
                 status = "degraded"
                 reason = f"Degraded: incomplete capture extent ({sidecar.termination_reason}, dropped={sidecar.known_lost_samples})"
@@ -284,36 +313,58 @@ class FeatureAnalysisWorker:
         with self._lock:
             if self._state != WorkerState.OPEN:
                 raise RuntimeError(f"Cannot submit to FeatureAnalysisWorker in state {self._state.value}")
+            if self._result_delivery == 'callbacks' and not self._result_sinks:
+                raise RuntimeError("Register the required callback before submitting work")
 
             gen = self._current_generation
+            sidecar = dataclasses.replace(sidecar, features=None, analysis_result=None,
+                                          feature_status='pending', feature_reason=None, processing_generation=gen)
 
-            if self._synchronous:
-                result = self._process_one(sidecar)
-                result = dataclasses.replace(result, processing_generation=gen)
-                if self._record_result_locked(result, gen):
-                    to_deliver = result
-                result_to_return = result
-            else:
+            if not self._synchronous:
                 try:
+                    if self._result_delivery == 'polling' and self._polling_reserved >= self._max_results:
+                        raise queue.Full
                     self._queue.put_nowait((gen, sidecar))
-                    result_to_return = sidecar
+                    if self._result_delivery == 'polling':
+                        self._polling_reserved += 1
+                    result_to_return = dataclasses.replace(sidecar, processing_generation=gen)
                 except queue.Full:
                     self._dropped_overload_count += 1
                     dropped_result = sidecar.with_features(
                         features=None,
                         feature_status="dropped_overload",
-                        feature_reason="Feature worker queue full",
+                        feature_reason="Feature worker input or reserved result capacity full; job not accepted",
                     )
                     dropped_result = dataclasses.replace(dropped_result, processing_generation=gen)
-                    if self._record_result_locked(dropped_result, gen):
-                        to_deliver = dropped_result
+                    # Rejection is returned directly to submitter; do not consume
+                    # a result slot reserved for an already accepted async job.
+                    self._processed_results.append(dropped_result)
+                    to_deliver = dropped_result
                     result_to_return = dropped_result
+
+        if self._synchronous:
+            started = time.perf_counter()
+            result = self._safe_process_one(sidecar)
+            result = dataclasses.replace(result, processing_generation=gen)
+            with self._lock:
+                self.analysis_seconds += time.perf_counter() - started
+                if self._record_result_locked(result, gen):
+                    to_deliver = result
+            result_to_return = result
 
         if to_deliver is not None:
             self._deliver_sink(to_deliver)
 
         assert result_to_return is not None
         return result_to_return
+
+    def _safe_process_one(self, sidecar: CaptureSidecar) -> CaptureSidecar:
+        """A calculation failure is a terminal result, never a dead worker thread."""
+        try:
+            return self._process_one(sidecar)
+        except Exception as exc:
+            return sidecar.with_features(features=None, feature_status="failed",
+                feature_reason=f"Analysis failed: {type(exc).__name__}: {exc}")
 
     def _worker_loop(self) -> None:
         while True:
@@ -339,7 +390,9 @@ class FeatureAnalysisWorker:
                         self._discarded_old_generation_count += 1
                         continue
 
-                result = self._process_one(sidecar)
+                started = time.perf_counter()
+                result = self._safe_process_one(sidecar)
+                self.analysis_seconds += time.perf_counter() - started
                 result = dataclasses.replace(result, processing_generation=gen)
                 with self._lock:
                     if self._record_result_locked(result, gen):
@@ -353,12 +406,15 @@ class FeatureAnalysisWorker:
     def cancel(self) -> None:
         """Cancel and drain all pending unstarted jobs from the queue."""
         with self._lock:
+            self._cancellation_operations += 1
             cancelled = 0
             while not self._queue.empty():
                 try:
                     item = self._queue.get_nowait()
                     if item is not _SENTINEL:
                         cancelled += 1
+                        if self._result_delivery == 'polling' and item[0] == self._current_generation:
+                            self._polling_reserved -= 1
                     else:
                         self._sentinel_enqueued = False
                     self._queue.task_done()
@@ -367,9 +423,14 @@ class FeatureAnalysisWorker:
             self._cancelled_count += cancelled
 
     def advance_generation(self) -> int:
-        """Advance generation to invalidate old in-flight captures across stream discontinuities."""
+        """Explicit cancellation barrier; ordinary raw acquisition gaps must not call this."""
         with self._lock:
+            self._cancellation_operations += 1
             self._current_generation += 1
+            self._polling_reserved = 0
+            while not self._result_queue.empty():
+                self._result_queue.get_nowait()
+                self._discarded_old_generation_count += 1
             return self._current_generation
 
     def shutdown(self, drain: bool = True, timeout: float = 5.0) -> None:
@@ -423,7 +484,9 @@ class FeatureAnalysisWorker:
     def reset(self) -> None:
         """Reset internal queue, results, and counters, advancing generation to invalidate in-flight jobs."""
         with self._lock:
+            self._cancellation_operations += 1
             self._current_generation += 1
+            self._polling_reserved = 0
             self._sentinel_enqueued = False
             cancelled = 0
             while not self._queue.empty():

@@ -125,9 +125,11 @@ def test_domain_identity_and_scale_are_separate():
     q = policy()
     d = EnergyDetector(window_size=16, hop_size=8, pfa_on=.01, pfa_off=.1, threshold_policy=q)
     for scale in (.1, .867, 1.121, 10):
+        d.reset()  # Independent repeated measurement at the same absolute origin.
         ref = NoiseEstimate(STREAM.stream_id, 0, 10*math.log10(q.mean_power_linear*scale), reference_domain=q.reference_domain)
         assert d.process(block(np.full(16, .003)), ref)
     wrong = dataclasses.replace(q.reference_domain, gain_id="different_gain")
+    d.reset()
     with pytest.raises(PolicyCompatibilityError):
         d.process(block(np.full(16, .003)), NoiseEstimate(STREAM.stream_id, 0, -40, reference_domain=wrong))
 

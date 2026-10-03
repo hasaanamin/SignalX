@@ -11,6 +11,7 @@ from scipy.stats import gamma
 
 from signal_processing.core.contracts import DetectionMeasurement, IQBlock, NoiseEstimate, NoiseReferenceDomain
 from signal_processing.core.interfaces import DetectorProtocol, Resettable
+from signal_processing.core.exceptions import StreamConsistencyError
 from signal_processing.detection.exceptions import (
     FilterConfigurationError,
     PolicyCompatibilityError,
@@ -88,6 +89,11 @@ class EnergyDetector(DetectorProtocol, Resettable):
         self._residual_start_sample: int = 0
         self._next_window_sample: int = 0
         self._phase_accumulator: float = 0.0
+        self._input_end: int | None = None
+        self._input_stream = None
+        self._input_sequence: int | None = None
+        self._api_mode: str | None = None
+        self._path_samples = 0
 
         # Filter setup for configured-band
         self._sos: np.ndarray | None = None
@@ -104,6 +110,8 @@ class EnergyDetector(DetectorProtocol, Resettable):
         self._threshold_policy: ThresholdPolicy | None = None
         if threshold_policy is not None:
             self.set_threshold_policy(threshold_policy)
+        elif require_supported_pfa:
+            raise PolicyCompatibilityError("Strict supported-Pfa operation requires a held-out policy")
 
     def set_threshold_policy(self, policy: ThresholdPolicy) -> None:
         """Set and validate an empirical or analytic threshold policy."""
@@ -121,7 +129,7 @@ class EnergyDetector(DetectorProtocol, Resettable):
             raise PolicyCompatibilityError(
                 f"Policy hop_size ({policy.hop_size}) does not match detector hop_size ({self._hop_size})"
             )
-        if not math.isclose(policy.sample_rate_hz, self._sample_rate_hz, rel_tol=1e-5):
+        if not math.isclose(policy.sample_rate_hz, self._sample_rate_hz, rel_tol=1e-12):
             raise PolicyCompatibilityError(
                 f"Sample rate mismatch: policy sample_rate_hz ({policy.sample_rate_hz}) does not match detector sample_rate_hz ({self._sample_rate_hz})"
             )
@@ -262,10 +270,31 @@ class EnergyDetector(DetectorProtocol, Resettable):
         return "stationary_gaussian_quadratic_bound" if self._mode == "configured_band" else "iid_complex_gaussian_gamma"
 
     def _validate_input(self, block: IQBlock) -> None:
+        if not isinstance(block, IQBlock):
+            raise TypeError("Expected a validated immutable IQBlock")
         if not math.isclose(block.stream.sample_rate_hz, self._sample_rate_hz, rel_tol=1e-12):
             raise PolicyCompatibilityError("Input sample rate differs from detector sample rate")
-        if not np.all(np.isfinite(block.iq)):
-            raise ValueError("Input IQ must contain only finite samples")
+        # IQBlock guarantees finite complex64 storage backed by immutable bytes.
+        # Re-scanning every overlapping hop adds no validation at this boundary.
+
+    def _validate_continuity(self, block: IQBlock, api: str) -> None:
+        self._validate_input(block)
+        if self._api_mode not in (None, api, 'warmup'):
+            raise StreamConsistencyError("Do not mix measurement, streaming and raw preparation APIs without reset")
+        if block.dropped_samples_before or block.overflow:
+            raise StreamConsistencyError("Direct detector discontinuity requires explicit reset and a clean new-epoch block")
+        if self._input_end is not None:
+            if block.start_sample != self._input_end or block.stream != self._input_stream:
+                raise StreamConsistencyError("Detector input is not contiguous in the same stream; reset required")
+            # Repeated sequence numbers allow subdivisions of one transport block.
+            # Jumps are legal if sample coordinates remain continuous.
+            if block.sequence_number < self._input_sequence:
+                raise StreamConsistencyError("Detector sequence numbers must be nondecreasing")
+
+    def _commit_input(self, block: IQBlock, api: str) -> None:
+        self._input_end, self._input_stream = block.end_sample, block.stream
+        self._input_sequence, self._api_mode = block.sequence_number, api
+        self._path_samples += block.num_samples
 
     @property
     def window_size(self) -> int:
@@ -292,14 +321,33 @@ class EnergyDetector(DetectorProtocol, Resettable):
         """The most recent detection-domain (mixed and filtered) IQ array."""
         return getattr(self, "_last_detection_iq", np.empty(0, dtype=np.complex64))
 
-    def prepare_detection_iq(self, iq: np.ndarray) -> np.ndarray:
-        """Apply frequency downmixing and filtering to convert raw IQ to detection domain."""
-        return self._prepare_detection_iq(iq)
+    def prepare_detection_iq(self, iq: np.ndarray | IQBlock) -> np.ndarray:
+        """Warmup only. IQBlock anchors continuation; uncoordinated arrays require reset before detection."""
+        if isinstance(iq, IQBlock):
+            self._validate_continuity(iq, 'warmup')
+            if not iq.num_samples:
+                return iq.iq
+            result = self._prepare_detection_iq(iq.iq)
+            self._commit_input(iq, 'warmup')
+            return result
+        if self._api_mode not in (None, 'raw'):
+            raise StreamConsistencyError("Raw preparation cannot share a detector with positioned input; reset required")
+        if iq.ndim != 1 or not np.iscomplexobj(iq) or not np.all(np.isfinite(iq)):
+            raise ValueError("Expected finite complex 1D IQ")
+        if not len(iq):
+            return iq
+        result = self._prepare_detection_iq(iq)
+        self._api_mode = 'raw'
+        return result
 
     def _calculate_thresholds(
         self, noise_estimate: NoiseEstimate, window_size: int | None = None
     ) -> tuple[float, float, float, float]:
-        """Calculate (t_on_dbfs, t_off_dbfs, p_noise_lin, p_noise_dbfs)."""
+        """Compatibility preview: physical dB thresholds (never display-floored)."""
+        on, off, noise, db = self._linear_thresholds(noise_estimate, window_size)
+        return 10*math.log10(on), 10*math.log10(off), noise, db
+
+    def _linear_thresholds(self, noise_estimate: NoiseEstimate, window_size: int | None = None):
         if not noise_estimate.valid or not math.isfinite(noise_estimate.noise_power_dbfs):
             raise UncalibratedNoiseError(
                 f"Cannot compute detection thresholds: noise estimate is invalid or non-finite "
@@ -309,13 +357,26 @@ class EnergyDetector(DetectorProtocol, Resettable):
         p_noise_dbfs = float(noise_estimate.noise_power_dbfs)
         if noise_estimate.reference_domain is not None and noise_estimate.reference_domain != self.reference_domain:
             raise PolicyCompatibilityError("Noise reference domain differs from detector path/gain")
-        p_noise_lin = 10.0 ** (p_noise_dbfs / 10.0)
+        try:
+            p_noise_lin = 10.0 ** (p_noise_dbfs / 10.0)
+        except OverflowError as exc:
+            raise UncalibratedNoiseError("Noise reference exceeds finite float64 power range") from exc
         if p_noise_lin <= 0.0 or not math.isfinite(p_noise_lin):
             raise UncalibratedNoiseError(
                 f"Cannot compute detection thresholds: noise power {p_noise_lin} must be strictly positive"
             )
 
-        if self._threshold_policy is not None and self._threshold_policy.mode == "empirical_matched":
+        n = int(window_size) if window_size is not None else self._window_size
+        if self._require_supported_pfa:
+            policy = self._threshold_policy
+            if policy is None or not policy.supported_pfa or n != policy.window_size:
+                raise PolicyCompatibilityError("Held-out evidence requires the validated statistic and actual N")
+            if self._path_samples < policy.settling_samples:
+                raise PolicyCompatibilityError("Held-out policy requires explicit positioned settling/warmup before detection")
+            if not math.isclose(p_noise_lin, policy.mean_power_linear, rel_tol=1e-12):
+                raise PolicyCompatibilityError("Held-out evidence requires unchanged absolute thresholds/reference; revalidate scaling")
+            t_on_lin, t_off_lin = policy.t_on_linear, policy.t_off_linear
+        elif self._threshold_policy is not None and self._threshold_policy.mode == "empirical_matched":
             p_ref = self._threshold_policy.mean_power_linear
             if noise_estimate.reference_domain is not None:
                 if noise_estimate.reference_domain != self.reference_domain:
@@ -330,8 +391,6 @@ class EnergyDetector(DetectorProtocol, Resettable):
                 raise PolicyCompatibilityError("Held-out support applies to fixed calibrated thresholds; revalidate after scale updates")
             t_on_lin = self._threshold_policy.t_on_linear * scale_ratio
             t_off_lin = self._threshold_policy.t_off_linear * scale_ratio
-            t_on_dbfs = 10.0 * math.log10(max(t_on_lin, self._conversion_floor))
-            t_off_dbfs = 10.0 * math.log10(max(t_off_lin, self._conversion_floor))
         else:
             n = int(window_size) if window_size is not None else self._window_size
             if n == self._window_size:
@@ -345,14 +404,40 @@ class EnergyDetector(DetectorProtocol, Resettable):
                     scale = p_noise_lin / n
                     t_on_lin = float(gamma.isf(self._pfa_on, a=n, scale=scale))
                     t_off_lin = float(gamma.isf(self._pfa_off, a=n, scale=scale))
-            t_on_dbfs = 10.0 * math.log10(max(t_on_lin, self._conversion_floor))
-            t_off_dbfs = 10.0 * math.log10(max(t_off_lin, self._conversion_floor))
+        if not 0 < t_off_lin < t_on_lin < math.inf:
+            raise UncalibratedNoiseError("Physical thresholds underflow, overflow or collapse at this numerical scale")
+        if math.log10(t_on_lin) <= math.log10(t_off_lin):
+            raise UncalibratedNoiseError("Threshold logarithms are not numerically distinguishable")
+        # Policies also accept NumPy scalar inputs. Normalize so decision flags
+        # remain strict Python bools in the public measurement contract.
+        return float(t_on_lin), float(t_off_lin), p_noise_lin, p_noise_dbfs
 
-        # Enforce strict hysteresis invariant: on > off
-        if t_on_dbfs <= t_off_dbfs:
-            t_on_dbfs = t_off_dbfs + 0.1
-
-        return t_on_dbfs, t_off_dbfs, p_noise_lin, p_noise_dbfs
+    def _measurement(self, block, start, end, power, thresholds):
+        on, off, noise, noise_db = thresholds
+        if not math.isfinite(power) or power < 0:
+            raise ValueError("Unrepresentable physical window power")
+        fields = dict(
+            stream_id=block.stream.stream_id, block_sequence_number=block.sequence_number,
+            start_sample=start, end_sample=end,
+            signal_power_dbfs=10*math.log10(power if power > 0 else self._conversion_floor),
+            noise_power_dbfs=noise_db,
+            snr_estimate_db=10*(math.log10(max(power-noise, self._conversion_floor))-math.log10(noise)),
+            on_threshold_dbfs=10*math.log10(on), off_threshold_dbfs=10*math.log10(off),
+            above_on_threshold=power >= on, below_off_threshold=power < off,
+            signal_power_linear=power, noise_power_linear=noise,
+            on_threshold_linear=on, off_threshold_linear=off,
+            threshold_support_method=('held_out_clopper_pearson_bonferroni' if self._require_supported_pfa
+                                      else 'uncertified_training_quantile' if self._threshold_policy is not None
+                                      and self._threshold_policy.mode == 'empirical_matched' else 'model_only'),
+            threshold_evidence_id=self._threshold_policy.evidence_id if self._require_supported_pfa else None)
+        # Trusted internal construction: IQBlock validated metadata/coordinates,
+        # _linear_thresholds validated positive ordered finite thresholds/reference,
+        # and this method validated physical power and derived every diagnostic.
+        # Public DetectionMeasurement(...) still performs the full validation.
+        # Avoid repeating ~20 scalar type/log checks at every real-time window.
+        result = object.__new__(DetectionMeasurement)
+        result.__dict__.update(fields)
+        return result
 
     def _prepare_detection_iq(self, iq: np.ndarray) -> np.ndarray:
         """Apply frequency mixing and filtering if configured_band mode is active."""
@@ -381,7 +466,7 @@ class EnergyDetector(DetectorProtocol, Resettable):
         noise_estimate: NoiseEstimate,
     ) -> DetectionMeasurement:
         """Process an IQBlock as a single measurement window to conform to DetectorProtocol."""
-        self._validate_input(block)
+        self._validate_continuity(block, 'measurement')
         if block.num_samples == 0:
             raise ValueError("Input IQBlock must not be empty")
 
@@ -391,36 +476,23 @@ class EnergyDetector(DetectorProtocol, Resettable):
                 f"(valid={noise_estimate.valid}, noise_power_dbfs={noise_estimate.noise_power_dbfs})"
             )
 
-        if self._threshold_policy is not None and self._threshold_policy.mode == "empirical_matched":
+        if self._threshold_policy is not None and self._threshold_policy.mode == "empirical_matched" and not self._require_supported_pfa:
             if self._threshold_policy.window_size != block.num_samples:
                 raise FilterConfigurationError(
                     f"Empirical threshold policy calibrated for N={self._threshold_policy.window_size} "
                     f"cannot be applied to block length N={block.num_samples}"
                 )
 
-        t_on_dbfs, t_off_dbfs, p_noise_lin, p_noise_dbfs = self._calculate_thresholds(
+        thresholds = self._linear_thresholds(
             noise_estimate, window_size=block.num_samples
         )
 
         det_iq = self._prepare_detection_iq(block.iq)
         det_c128 = det_iq.astype(np.complex128)
         p_lin = float(np.mean(np.real(det_c128) ** 2 + np.imag(det_c128) ** 2))
-        p_dbfs = 10.0 * math.log10(max(p_lin, self._conversion_floor))
-        snr_db = 10.0 * math.log10(max(p_lin - p_noise_lin, self._conversion_floor) / p_noise_lin)
-
-        return DetectionMeasurement(
-            stream_id=block.stream.stream_id,
-            block_sequence_number=block.sequence_number,
-            start_sample=block.start_sample,
-            end_sample=block.end_sample,
-            signal_power_dbfs=p_dbfs,
-            noise_power_dbfs=p_noise_dbfs,
-            snr_estimate_db=snr_db,
-            on_threshold_dbfs=t_on_dbfs,
-            off_threshold_dbfs=t_off_dbfs,
-            above_on_threshold=p_dbfs >= t_on_dbfs,
-            below_off_threshold=p_dbfs < t_off_dbfs,
-        )
+        result = self._measurement(block, block.start_sample, block.end_sample, p_lin, thresholds)
+        self._commit_input(block, 'measurement')
+        return result
 
     def process_windows(
         self,
@@ -432,14 +504,16 @@ class EnergyDetector(DetectorProtocol, Resettable):
         Carries residual samples across blocks to maintain continuous, boundary-independent
         evaluation anchored to absolute source coordinates.
         """
-        self._validate_input(block)
+        self._validate_continuity(block, 'streaming')
+        if block.num_samples == 0:
+            return []
         # Validate prerequisites BEFORE preparing detection IQ or mutating filter/phase state
         if not noise_estimate.valid or not math.isfinite(noise_estimate.noise_power_dbfs):
             raise UncalibratedNoiseError(
                 f"Cannot compute detection thresholds: noise estimate is invalid or non-finite "
                 f"(valid={noise_estimate.valid}, noise_power_dbfs={noise_estimate.noise_power_dbfs})"
             )
-        t_on_dbfs, t_off_dbfs, p_noise_lin, p_noise_dbfs = self._calculate_thresholds(noise_estimate)
+        thresholds = self._linear_thresholds(noise_estimate)
 
         det_iq = self._prepare_detection_iq(block.iq)
         self._last_detection_iq = det_iq
@@ -457,12 +531,18 @@ class EnergyDetector(DetectorProtocol, Resettable):
 
         # Convert combined IQ to float64 squared magnitude for rolling sum
         combined_c128 = combined_iq.astype(np.complex128)
-        mag_sq = np.real(combined_c128) ** 2 + np.imag(combined_c128) ** 2
-
-        # Cumsum prefix array for O(1) window power extraction
-        prefix = np.empty(total_samples + 1, dtype=np.float64)
-        prefix[0] = 0.0
-        np.cumsum(mag_sq, out=prefix[1:])
+        # Most pipeline hops produce exactly one full window. A direct complex128
+        # inner product avoids squared-magnitude and prefix allocations, and has
+        # no subtractive cancellation. General transport partitions retain O(n)
+        # prefix evaluation. Both calculate identical physical window statistics.
+        single_power = None
+        if total_samples == self._window_size:
+            single_power = float(np.vdot(combined_c128, combined_c128).real)
+        else:
+            mag_sq = np.real(combined_c128) ** 2 + np.imag(combined_c128) ** 2
+            prefix = np.empty(total_samples + 1, dtype=np.float64)
+            prefix[0] = 0.0
+            np.cumsum(mag_sq, out=prefix[1:])
 
         # Determine starting window index
         w_start = max(start_coord, self._next_window_sample)
@@ -474,29 +554,13 @@ class EnergyDetector(DetectorProtocol, Resettable):
 
         curr_rel = rel_start
         while curr_rel + self._window_size <= total_samples:
-            p_sum = prefix[curr_rel + self._window_size] - prefix[curr_rel]
+            p_sum = single_power if single_power is not None else prefix[curr_rel + self._window_size] - prefix[curr_rel]
             p_lin = float(p_sum / self._window_size)
-            p_dbfs = 10.0 * math.log10(max(p_lin, self._conversion_floor))
-            snr_db = 10.0 * math.log10(max(p_lin - p_noise_lin, self._conversion_floor) / p_noise_lin)
 
             abs_win_start = start_coord + curr_rel
             abs_win_end = abs_win_start + self._window_size
 
-            measurements.append(
-                DetectionMeasurement(
-                    stream_id=block.stream.stream_id,
-                    block_sequence_number=block.sequence_number,
-                    start_sample=abs_win_start,
-                    end_sample=abs_win_end,
-                    signal_power_dbfs=p_dbfs,
-                    noise_power_dbfs=p_noise_dbfs,
-                    snr_estimate_db=snr_db,
-                    on_threshold_dbfs=t_on_dbfs,
-                    off_threshold_dbfs=t_off_dbfs,
-                    above_on_threshold=p_dbfs >= t_on_dbfs,
-                    below_off_threshold=p_dbfs < t_off_dbfs,
-                )
-            )
+            measurements.append(self._measurement(block, abs_win_start, abs_win_end, p_lin, thresholds))
 
             curr_rel += self._hop_size
 
@@ -511,6 +575,7 @@ class EnergyDetector(DetectorProtocol, Resettable):
             self._residual_start_sample = start_coord + total_samples
             self._next_window_sample = start_coord + curr_rel
 
+        self._commit_input(block, 'streaming')
         return measurements
 
     def reset(self) -> None:
@@ -519,5 +584,7 @@ class EnergyDetector(DetectorProtocol, Resettable):
         self._residual_start_sample = 0
         self._next_window_sample = 0
         self._phase_accumulator = 0.0
+        self._input_end = self._input_stream = self._input_sequence = self._api_mode = None
+        self._path_samples = 0
         if self._sos is not None:
             self._sos_zi = np.zeros((self._sos.shape[0], 2), dtype=np.float64)

@@ -96,7 +96,9 @@ def test_atomic_worker_admission_is_preserved():
 
 def test_positive_input_output_overload_stays_bounded():
     r=observed('input_output_overload')
-    assert r['input_drop']==1 and r['output_drop']==2 and r['completed']==2
+    # Async polling now reserves terminal-result space at admission. Two jobs
+    # are explicitly rejected; the accepted job's result is never dropped.
+    assert r['input_drop']==2 and r['output_drop']==0 and r['completed']==1
     assert r['history_size']==1 and r['result_queue']==1 and r['unfinished']==0
 
 def test_filter_and_reference_domain_mismatch_is_not_silently_accepted():
@@ -259,4 +261,3 @@ def test_contiguous_received_prefix_remains_continuous_after_known_external_gap(
     w=h.FeatureAnalysisWorker(synchronous=True,skip_incomplete_quality=False)
     result=w.submit(sc);w.shutdown()
     assert result.analysis_result.capture_quality.is_continuous
-

@@ -182,7 +182,7 @@ class TestB01CalibrationPrefixAndRemainder:
             sequence_number=0,
             start_sample=0,
             timestamp_ns=1_000_000_000,
-            iq=np.zeros(32, dtype=np.complex64),
+            iq=np.full(32, .003, dtype=np.complex64),  # Positive physical calibration; zero training is now invalid.
         )
         res0 = pipe.process_block(b0)
         assert res0 == []
@@ -529,10 +529,10 @@ class TestB04PolicyValidationAndActualN:
 # B05: RESET AT GAPS AND COORDINATE GENERATIONS
 # ==============================================================================
 class TestB05DiscontinuityGenerations:
-    def test_gap_resets_estimator_residuals_and_advances_worker_generation(self, stream_1mhz: StreamInfo) -> None:
+    def test_gap_resets_estimator_residuals_and_preserves_worker_generation(self, stream_1mhz: StreamInfo) -> None:
         """On dropped samples, estimator reference resets to initial configured power,
 
-        residuals are purged, and worker advances generation.
+        residuals are purged, but assembled feature jobs survive the raw epoch change.
         """
         est = AdaptiveRobustNoiseEstimator(
             window_size=16,
@@ -564,8 +564,8 @@ class TestB05DiscontinuityGenerations:
         # Estimator was reset to initial configured power and residuals purged
         assert est.noise_power_linear == pytest.approx(1e-4)
         assert len(est._residual_samples) == 0
-        # Worker generation advanced
-        assert pipe.worker._generation > worker_gen_before
+        # F01: ordinary raw gaps are not authorized analysis cancellation.
+        assert pipe.worker._generation == worker_gen_before
 
 
 # ==============================================================================
