@@ -188,6 +188,7 @@ class StreamingCapturePipeline:
 
         self._enable_feature_analysis = bool(enable_feature_analysis)
         self._previous_block: IQBlock | None = None
+        self._time_anchor: tuple[int, int] | None = None
         self._noise_admission_sample: int | None = None
         self._pending_noise_buf: np.ndarray = np.empty(0, dtype=np.complex64)
         # Compatibility view: no IQ history is retained here.
@@ -291,12 +292,11 @@ class StreamingCapturePipeline:
             raise RuntimeError("Cannot process block: pipeline is in FAULTED state. Call reset() to recover.")
 
         emitted: list[CaptureSidecar] = []
+        transport_block = block
 
-        # Validate complex dtype before mutation
-        if not np.iscomplexobj(block.iq):
-            raise StreamConsistencyError(f"Block IQ data must be complex dtype, got {block.iq.dtype}")
-        if not np.all(np.isfinite(block.iq)):
-            raise StreamConsistencyError("Block IQ data contains NaN or Inf values")
+        # IQBlock construction already validates and freezes all received data.
+        if not isinstance(block, IQBlock):
+            raise StreamConsistencyError('Pipeline input must be an immutable IQBlock')
 
         # 1. Stream validation before mutating state
         if self._previous_block is None:
@@ -385,6 +385,17 @@ class StreamingCapturePipeline:
                 if block.start_sample < self._previous_block.end_sample:
                     raise StreamConsistencyError("Sample index overlap backwards during overflow")
 
+        # Receiver clock consistency is independent of sample continuity. Keep
+        # one original anchor; never accumulate transport-rounding drift. Unknown
+        # overflow ends timing trust; an explicit reset is required for clock-only
+        # changes. Two rounded integer-ns anchors may differ by at most 1 ns.
+        if not block.overflow and block.timestamp_ns is not None and self._time_anchor is not None:
+            from signal_processing.core.timebase import sample_offset_ns
+            index, timestamp = self._time_anchor
+            expected = timestamp + sample_offset_ns(block.start_sample-index, self._stream_info.sample_rate_hz)
+            if abs(block.timestamp_ns-expected) > 1:
+                raise StreamConsistencyError('Receiver timestamp contradicts the timing epoch (tolerance 1 ns); reset required for clock changes')
+
         # Check noise estimator status before mutating ring buffer state (B06 / C02 / D06)
         is_calibrating = False
         if hasattr(self._noise_estimator, "state"):
@@ -407,6 +418,9 @@ class StreamingCapturePipeline:
                 self._state = PipelineState.FAULTED
                 raise UncalibratedNoiseError("Cannot process block: noise estimator is uncalibrated")
             is_calibrating = True
+
+        if is_calibrating and getattr(self._noise_estimator, 'frozen', False):
+            raise StreamConsistencyError('Frozen pipeline warmup cannot consume input; unfreeze and retry the same unconsumed block')
 
         # Validate policy / threshold compatibility before ring/previous commit (D06)
         if not is_calibrating and hasattr(self._noise_estimator, "get_estimate"):
@@ -472,7 +486,9 @@ class StreamingCapturePipeline:
         # Update assembler timestamp anchor (discard trust after unknown overflow)
         if block.overflow:
             self._assembler.set_timestamp_anchor(block.start_sample, None)
-        elif block.timestamp_ns is not None:
+            self._time_anchor = None
+        elif block.timestamp_ns is not None and self._time_anchor is None:
+            self._time_anchor = (block.start_sample, block.timestamp_ns)
             self._assembler.set_timestamp_anchor(block.start_sample, block.timestamp_ns)
 
         if is_calibrating:
@@ -572,7 +588,7 @@ class StreamingCapturePipeline:
             self._input_residual_iq = np.empty(0, dtype=np.complex64)
             self._input_residual_start = combined_start + len(combined_iq)
 
-        self._previous_block = block
+        self._previous_block = transport_block
         self._sync_pending_age()
         return emitted
 
@@ -607,7 +623,7 @@ class StreamingCapturePipeline:
             # Detector validates prerequisites before filter mutation. Commit raw IQ only
             # after detection succeeds; any subsequent failure requires explicit reset.
             measurements = self._detector.process_windows(block, noise_est)
-            self._ring.write(block.start_sample, block.iq)
+            self._ring.write_received(block)
         except Exception:
             self._state = PipelineState.FAULTED
             raise
@@ -765,6 +781,7 @@ class StreamingCapturePipeline:
         self._assembler.reset()
         self._worker.reset()
         self._previous_block = None
+        self._time_anchor = None
         self._received_end_sample = None
         self._noise_admission_sample = None
         self._pending_noise_buf = np.empty(0, dtype=np.complex64)

@@ -18,6 +18,7 @@ from signal_processing.detection.exceptions import (
     UncalibratedNoiseError,
 )
 from signal_processing.detection.noise_estimation import ThresholdPolicy
+from signal_processing.detection._power import window_mean_power
 
 
 class EnergyDetector(DetectorProtocol, Resettable):
@@ -421,7 +422,9 @@ class EnergyDetector(DetectorProtocol, Resettable):
             start_sample=start, end_sample=end,
             signal_power_dbfs=10*math.log10(power if power > 0 else self._conversion_floor),
             noise_power_dbfs=noise_db,
-            snr_estimate_db=10*(math.log10(max(power-noise, self._conversion_floor))-math.log10(noise)),
+            snr_estimate_db=10*(math.log10(power-noise)-math.log10(noise)) if power > noise else 0.0,
+            snr_valid=power > noise,
+            snr_invalid_reason=None if power > noise else 'nonpositive_excess',
             on_threshold_dbfs=10*math.log10(on), off_threshold_dbfs=10*math.log10(off),
             above_on_threshold=power >= on, below_off_threshold=power < off,
             signal_power_linear=power, noise_power_linear=noise,
@@ -529,20 +532,9 @@ class EnergyDetector(DetectorProtocol, Resettable):
 
         measurements: list[DetectionMeasurement] = []
 
-        # Convert combined IQ to float64 squared magnitude for rolling sum
+        # Direct reductions exclude every sample outside the actual window.
+        # Prefix differences are unsafe even in float64 after a large transient.
         combined_c128 = combined_iq.astype(np.complex128)
-        # Most pipeline hops produce exactly one full window. A direct complex128
-        # inner product avoids squared-magnitude and prefix allocations, and has
-        # no subtractive cancellation. General transport partitions retain O(n)
-        # prefix evaluation. Both calculate identical physical window statistics.
-        single_power = None
-        if total_samples == self._window_size:
-            single_power = float(np.vdot(combined_c128, combined_c128).real)
-        else:
-            mag_sq = np.real(combined_c128) ** 2 + np.imag(combined_c128) ** 2
-            prefix = np.empty(total_samples + 1, dtype=np.float64)
-            prefix[0] = 0.0
-            np.cumsum(mag_sq, out=prefix[1:])
 
         # Determine starting window index
         w_start = max(start_coord, self._next_window_sample)
@@ -554,8 +546,7 @@ class EnergyDetector(DetectorProtocol, Resettable):
 
         curr_rel = rel_start
         while curr_rel + self._window_size <= total_samples:
-            p_sum = single_power if single_power is not None else prefix[curr_rel + self._window_size] - prefix[curr_rel]
-            p_lin = float(p_sum / self._window_size)
+            p_lin = window_mean_power(combined_c128[curr_rel:curr_rel + self._window_size])
 
             abs_win_start = start_coord + curr_rel
             abs_win_end = abs_win_start + self._window_size

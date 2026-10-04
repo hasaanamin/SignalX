@@ -535,7 +535,8 @@ class DetectionMeasurement:
         end_sample: Absolute stream exclusive end index (end_sample > start_sample).
         signal_power_dbfs: Measured block signal power in dBFS (finite).
         noise_power_dbfs: Reference noise floor power in dBFS (finite).
-        snr_estimate_db: Estimated SNR in dB (finite).
+        snr_estimate_db: Physical excess/noise SNR when snr_valid. Otherwise
+            finite 0.0 placeholder, NOT a measured SNR (see snr_invalid_reason).
         on_threshold_dbfs: Threshold power required to trigger detection (finite, > off_threshold_dbfs).
         off_threshold_dbfs: Threshold power required to declare signal end (finite, < on_threshold_dbfs).
         above_on_threshold: True if and only if signal_power_dbfs >= on_threshold_dbfs.
@@ -559,6 +560,8 @@ class DetectionMeasurement:
     off_threshold_linear: float | None = None
     threshold_support_method: str = "model_only"
     threshold_evidence_id: str | None = None
+    snr_valid: bool = True
+    snr_invalid_reason: str | None = None
 
     def __post_init__(self) -> None:
         _validate_non_blank_str(self.stream_id, "stream_id")
@@ -605,6 +608,13 @@ class DetectionMeasurement:
             "snr_estimate_db",
             _validate_finite_float(self.snr_estimate_db, "snr_estimate_db"),
         )
+        if type(self.snr_valid) is not bool:
+            raise ContractValidationError('snr_valid must be boolean')
+        if self.snr_valid:
+            if self.snr_invalid_reason is not None:
+                raise ContractValidationError('Valid SNR cannot have an invalid reason')
+        elif self.snr_invalid_reason != 'nonpositive_excess' or self.snr_estimate_db != 0.0:
+            raise ContractValidationError('Unavailable SNR requires nonpositive_excess and a 0.0 placeholder')
 
         if not isinstance(self.above_on_threshold, bool):
             raise ContractValidationError("Field 'above_on_threshold' must be a boolean")
@@ -621,6 +631,11 @@ class DetectionMeasurement:
             power, noise, on, off = physical
             if power < 0 or noise <= 0 or not 0 < off < on:
                 raise ContractValidationError("Invalid physical powers/threshold ordering")
+            if self.snr_valid != (power > noise):
+                raise ContractValidationError('SNR validity contradicts physical excess')
+            if self.snr_valid and not math.isclose(self.snr_estimate_db,
+                    10*(math.log10(power-noise)-math.log10(noise)), rel_tol=0, abs_tol=1e-9):
+                raise ContractValidationError('SNR contradicts physical excess/noise ratio')
             for linear, db in ((power, sig_pow), (noise, self.noise_power_dbfs), (on, on_th), (off, off_th)):
                 # Zero power has a finite display-only sentinel. Its linear field
                 # is authoritative; positive powers always have truthful logarithms.

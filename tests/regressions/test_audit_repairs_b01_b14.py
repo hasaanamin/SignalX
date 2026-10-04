@@ -247,7 +247,8 @@ class TestB02CausalGuardedAdaptiveNoise:
             seq = 0
             for i in range(0, n_samples, block_size):
                 chunk = full_iq[i : i + block_size]
-                b = IQBlock(stream=stream_1mhz, sequence_number=seq, start_sample=i, timestamp_ns=0, iq=chunk)
+                # G07: zero is a real timestamp, not an unknown-time placeholder.
+                b = IQBlock(stream=stream_1mhz, sequence_number=seq, start_sample=i, timestamp_ns=i*1000, iq=chunk)
                 seq += 1
                 emitted.extend(pipe.process_block(b))
             emitted.extend(pipe.flush())
@@ -305,7 +306,7 @@ class TestB02CausalGuardedAdaptiveNoise:
             seq = 0
             for i in range(0, n_samples, block_size):
                 chunk = full_iq[i : i + block_size]
-                b = IQBlock(stream=stream_1mhz, sequence_number=seq, start_sample=i, timestamp_ns=0, iq=chunk)
+                b = IQBlock(stream=stream_1mhz, sequence_number=seq, start_sample=i, timestamp_ns=i*1000, iq=chunk)
                 seq += 1
                 emitted.extend(pipe.process_block(b))
             emitted.extend(pipe.flush())
@@ -718,7 +719,7 @@ class TestB08AvailableEOFTail:
             seq = 0
             for i in range(0, 69, block_size):
                 chunk = full_iq[i : i + block_size]
-                b = IQBlock(stream_1mhz, seq, i, 0, chunk)
+                b = IQBlock(stream_1mhz, seq, i, i*1000, chunk)
                 seq += 1
                 emitted.extend(pipe.process_block(b))
             emitted.extend(pipe.flush())

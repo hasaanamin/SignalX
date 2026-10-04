@@ -406,6 +406,11 @@ class GaussianNoiseEstimator(NoiseEstimatorProtocol, Resettable):
         """Freeze/unfreeze noise adaptation during active signal bursts."""
         self._frozen = bool(frozen)
 
+    @property
+    def frozen(self) -> bool:
+        """Whether authorized training is paused (no samples may be consumed)."""
+        return self._frozen
+
     def get_thresholds_linear(self) -> tuple[float, float]:
         """Compute (T_on, T_off) in linear power units."""
         if not self.is_calibrated or self._noise_power_linear is None:
@@ -1037,17 +1042,14 @@ class EmpiricalNoiseCalibrator:
         total_len = len(combined)
 
         if total_len >= w_size:
+            from ._power import window_mean_power
             n_win = (total_len - w_size) // h_size + 1
             comb_c128 = combined.astype(np.complex128)
-            mag_sq = np.real(comb_c128) ** 2 + np.imag(comb_c128) ** 2
-            prefix = np.empty(total_len + 1, dtype=np.float64)
-            prefix[0] = 0.0
-            np.cumsum(mag_sq, out=prefix[1:])
 
             for w_idx in range(n_win):
                 w_start = w_idx * h_size
                 w_end = w_start + w_size
-                p_win = (prefix[w_end] - prefix[w_start]) / w_size
+                p_win = window_mean_power(comb_c128[w_start:w_end])
                 self._cal_window_powers.append(float(p_win))
 
             rem_start = n_win * h_size

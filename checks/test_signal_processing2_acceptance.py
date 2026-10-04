@@ -69,10 +69,12 @@ def test_synchronous_worker_delivers_registered_sink():
     r=observed('sync_sink')
     assert r['callbacks']==['e']
 
-def test_overload_outcome_is_delivered_to_registered_sink():
+def test_overload_outcome_is_returned_without_calling_registered_sink():
     r=observed('overload_sink')
     assert r['input_drops']==1
-    assert r['callbacks'].count('dropped_overload')==1
+    # G08: unaccepted rejection is terminal on submit's return, not a callback.
+    assert r['rejected_status']=='dropped_overload'
+    assert r['callbacks']==['ok','ok']
 
 def test_repeated_shutdown_timeouts_leave_no_orphan_sentinels():
     r=observed('repeated_shutdown')

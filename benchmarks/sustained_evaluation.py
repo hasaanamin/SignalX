@@ -74,12 +74,17 @@ def bounded_acquisition(duration_seconds=5.0, *, sample_rate_hz=1e6, block_size=
     recent = collections.deque(maxlen=4096)
     recent_set = set()
     delivery = dict(terminal_results=0, duplicate_results=0, failed_results=0,
-                    overloaded_results=0, ledger_overflow=0, raw_captures=0)
+                    overloaded_results=0, ledger_overflow=0, raw_captures=0,
+                    accepted_callback_results=0, immediate_unaccepted_results=0)
     def correlate(sc, sign):
         key = (sc.stream_epoch, sc.event_id)
         with ledger_lock:
             if sign == -1:
                 delivery['terminal_results'] += 1
+                if sc.feature_status == 'dropped_overload':
+                    delivery['immediate_unaccepted_results'] += 1
+                else:
+                    delivery['accepted_callback_results'] += 1
                 delivery['failed_results'] += sc.feature_status == 'failed'
                 delivery['overloaded_results'] += sc.feature_status == 'dropped_overload'
                 if key in recent_set:
@@ -97,6 +102,12 @@ def bounded_acquisition(duration_seconds=5.0, *, sample_rate_hz=1e6, block_size=
                 pending[key] = delta
             else:
                 pending.pop(key, None)
+    def observe_raw(sc):
+        correlate(sc, 1)
+        # Unaccepted jobs have one terminal outcome returned to acquisition,
+        # not a callback on that thread and not a reserved polling result.
+        if sc.feature_status == 'dropped_overload':
+            correlate(sc, -1)
     if features:
         pipe.worker.add_result_sink(lambda sc: correlate(sc, -1))
     if result_sink is not None:
@@ -112,7 +123,8 @@ def bounded_acquisition(duration_seconds=5.0, *, sample_rate_hz=1e6, block_size=
                  trailing_dropped_samples=0, acquisition_queue_peak=0, worker_queue_peak=0,
                  blocks_processed=0, deadline_misses=0, max_backlog_ms=0.0,
                  max_producer_lateness_ms=0.0, emitted_events=0, consumer_failed_samples=0,
-                 consumer_processing_cpu_seconds=0.0, errors=[])
+                 consumer_processing_cpu_seconds=0.0, producer_preparation_seconds=0.0,
+                 producer_wait_seconds=0.0, producer_queue_seconds=0.0, errors=[])
     latencies = collections.deque(maxlen=65536)
     processing_times = collections.deque(maxlen=65536)
     memory = []
@@ -141,9 +153,12 @@ def bounded_acquisition(duration_seconds=5.0, *, sample_rate_hz=1e6, block_size=
                     lost += n
                     continue
                 # Allocate only one transport block. No recording-sized array.
+                preparation_start = time.perf_counter()
                 iq = (rng.normal(size=n) + 1j * rng.normal(size=n)) * math.sqrt(1e-4 / 2)
                 indices = start + np.arange(n)
                 iq[(indices % 4096) < 256] += 0.1
+                stats['producer_preparation_seconds'] += time.perf_counter()-preparation_start
+                wait_start = time.perf_counter()
                 while True:
                     remaining = arrival - time.perf_counter()
                     if remaining <= 0 or stop.wait(remaining):
@@ -151,6 +166,7 @@ def bounded_acquisition(duration_seconds=5.0, *, sample_rate_hz=1e6, block_size=
                 if stop.is_set():
                     break
                 now = time.perf_counter()  # Recheck after every sleep, including overshoot.
+                stats['producer_wait_seconds'] += now-wait_start
                 stats["max_producer_lateness_ms"] = max(stats["max_producer_lateness_ms"], 1000 * max(0, now - arrival))
                 stats["produced_samples"] += n
                 if now > arrival + interval:
@@ -158,6 +174,7 @@ def bounded_acquisition(duration_seconds=5.0, *, sample_rate_hz=1e6, block_size=
                     stats["dropped_samples"] += n
                     stats["producer_deadline_dropped_samples"] += n
                     continue
+                queue_start = time.perf_counter()
                 block = IQBlock(stream, seq, start, None, iq.astype(np.complex64), dropped_samples_before=lost)
                 try:
                     arrivals.put_nowait((arrival, block))
@@ -168,6 +185,7 @@ def bounded_acquisition(duration_seconds=5.0, *, sample_rate_hz=1e6, block_size=
                     lost += n
                     stats["dropped_samples"] += n
                     stats["queue_dropped_samples"] += n
+                stats['producer_queue_seconds'] += time.perf_counter()-queue_start
         except Exception as exc:
             stats["errors"].append(f"producer: {type(exc).__name__}: {exc}")
         finally:
@@ -199,13 +217,13 @@ def bounded_acquisition(duration_seconds=5.0, *, sample_rate_hz=1e6, block_size=
                     stats['consumer_failed_samples'] += block.num_samples-committed
                     for sc in getattr(exc, 'completed_captures', ()):
                         if features:
-                            correlate(sc, 1)
+                            observe_raw(sc)
                     raise
                 processing_times.append(1000*(time.perf_counter()-t0))
                 stats['consumer_processing_cpu_seconds'] += time.thread_time()-cpu0
                 for sc in events:
                     if features:
-                        correlate(sc, 1)
+                        observe_raw(sc)
                 elapsed = time.perf_counter() - arrival
                 latencies.append(1000*elapsed)
                 stats["consumed_samples"] += block.num_samples
@@ -225,7 +243,7 @@ def bounded_acquisition(duration_seconds=5.0, *, sample_rate_hz=1e6, block_size=
         stats["emitted_events"] += len(tail)
         for sc in tail:
             if features:
-                correlate(sc, 1)
+                observe_raw(sc)
     except Exception as exc:
         stats["errors"].append(f"consumer: {type(exc).__name__}: {exc}")
         stop.set()
@@ -274,7 +292,7 @@ def bounded_acquisition(duration_seconds=5.0, *, sample_rate_hz=1e6, block_size=
     stats["recovered"] = (not producer.is_alive() and arrivals.empty() and arrivals.unfinished_tasks == 0
                           and pipe.worker.state.value == 'CLOSED' and pipe.worker._queue.unfinished_tasks == 0)
     stats["sample_accounting_balanced"] = total == stats["consumed_samples"] + stats["dropped_samples"]
-    stats['delivery_scope'] = 'required_callbacks; polling_queue_disabled' if features else 'capture_return'
+    stats['delivery_scope'] = 'accepted_callbacks_and_immediate_unaccepted_returns; polling_queue_disabled' if features else 'capture_return'
     stats['delivery'] = dict(delivery, unresolved_identities=len(pending))
     stats['acquisition_passed'] = (not stats['errors'] and stats['sample_accounting_balanced'] and
                                   stats['deadline_misses'] == 0 and stats['dropped_samples'] == 0)

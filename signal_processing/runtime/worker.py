@@ -84,6 +84,10 @@ class FeatureAnalysisWorker:
         self.sink_seconds = 0.0
         self._processed_results: collections.deque[CaptureSidecar] = collections.deque(maxlen=self._max_results)
         self._lock = threading.Lock()
+        self._completion = threading.Condition(self._lock)
+        # At most max_queue_size concurrent synchronous callers; each remains
+        # admitted through result storage AND out-of-lock callback delivery.
+        self._sync_threads: set[int] = set()
         self._sentinel_enqueued: bool = False
 
         self._thread: threading.Thread | None = None
@@ -157,6 +161,12 @@ class FeatureAnalysisWorker:
         """List snapshot of bounded processed sidecars."""
         with self._lock:
             return list(self._processed_results)
+
+    @property
+    def unfinished_work(self) -> int:
+        """Admitted synchronous analysis/delivery or async queued/running work."""
+        with self._lock:
+            return len(self._sync_threads) if self._synchronous else self._queue.unfinished_tasks
 
     def _record_result_locked(self, result: CaptureSidecar, generation: int) -> bool:
         """Store result in bounded deque and result queue under self._lock."""
@@ -278,6 +288,8 @@ class FeatureAnalysisWorker:
                                                else self._aggregator.extract_analysis_result(context))
             if not isinstance(analysis_result, AnalysisResult):
                 raise TypeError("analysis_function must return AnalysisResult")
+            if self._analysis_function is not None:
+                self._validate_backend_result(analysis_result, context, cap_quality)
             if not sidecar.event.complete:
                 status = "degraded"
                 reason = f"Degraded: incomplete capture extent ({sidecar.termination_reason}, dropped={sidecar.known_lost_samples})"
@@ -301,6 +313,40 @@ class FeatureAnalysisWorker:
                 feature_reason=f"Feature extraction failed: {type(exc).__name__}: {exc}",
             )
 
+    @staticmethod
+    def _validate_backend_result(result, context, quality):
+        """Validate observable attribution, not arbitrary backend arithmetic.
+
+        Custom feature sets/schema and extractor overrides are supported. Context
+        transforms, sample domain, policy content identity and capture provenance
+        must still match. No coordinates beyond those in these records are inferred.
+        """
+        from signal_processing.core.contracts import ExtractionPolicy
+        vector, policy = result.feature_vector, result.policy
+        if vector.event_id != context.event_id:
+            raise ValueError('Backend result event identity differs from admitted event')
+        if result.capture_quality != quality:
+            raise ValueError('Backend capture quality/provenance differs from admitted context')
+        if policy.schema_version != vector.feature_schema_version or set(policy.feature_names) != set(vector.features):
+            raise ValueError('Backend feature schema/names contradict its policy')
+        ExtractionPolicy.from_dict(policy.to_dict())
+        cfg, n = context.config, context.signal_num_samples
+        welch = cfg.psd_mode == 'welch'
+        nperseg = (cfg.psd_nperseg if cfg.psd_nperseg is not None else min(n, 1024)) if welch else n
+        expected = dict(sample_rate_hz=context.sample_rate_hz, observation_samples=n,
+            psd_mode=cfg.psd_mode, nfft=cfg.nfft if cfg.nfft is not None else nperseg,
+            psd_nperseg=nperseg,
+            psd_noverlap=(cfg.psd_noverlap if cfg.psd_noverlap is not None else nperseg//2) if welch else 0,
+            spectral_window=cfg.psd_welch_window if welch else cfg.spectral_window,
+            centered_spectrum=cfg.centered_spectrum, power_floor_dbfs=cfg.power_floor_dbfs,
+            psd_floor_dbfs_per_hz=cfg.psd_floor_dbfs_per_hz,
+            phase_amplitude_threshold=cfg.phase_amplitude_threshold,
+            autocorrelation_normalized=cfg.autocorrelation_normalized,
+            autocorrelation_max_lag_samples=cfg.autocorrelation_max_lag_samples if cfg.autocorrelation_max_lag_samples is not None else max(0, n-1))
+        for name, value in expected.items():
+            if getattr(policy, name) != value:
+                raise ValueError(f'Backend policy {name} differs from admitted context')
+
     def submit(self, sidecar: CaptureSidecar) -> CaptureSidecar:
         """Submit a captured event sidecar for feature analysis.
 
@@ -319,6 +365,12 @@ class FeatureAnalysisWorker:
             gen = self._current_generation
             sidecar = dataclasses.replace(sidecar, features=None, analysis_result=None,
                                           feature_status='pending', feature_reason=None, processing_generation=gen)
+
+            if self._synchronous:
+                ident = threading.get_ident()
+                if ident in self._sync_threads or len(self._sync_threads) >= self._max_queue_size:
+                    raise RuntimeError('Synchronous admission capacity reached or recursive submit; work not accepted')
+                self._sync_threads.add(ident)
 
             if not self._synchronous:
                 try:
@@ -339,18 +391,25 @@ class FeatureAnalysisWorker:
                     # Rejection is returned directly to submitter; do not consume
                     # a result slot reserved for an already accepted async job.
                     self._processed_results.append(dropped_result)
-                    to_deliver = dropped_result
                     result_to_return = dropped_result
 
         if self._synchronous:
-            started = time.perf_counter()
-            result = self._safe_process_one(sidecar)
-            result = dataclasses.replace(result, processing_generation=gen)
-            with self._lock:
-                self.analysis_seconds += time.perf_counter() - started
-                if self._record_result_locked(result, gen):
-                    to_deliver = result
-            result_to_return = result
+            try:
+                started = time.perf_counter()
+                result = self._safe_process_one(sidecar)
+                result = dataclasses.replace(result, processing_generation=gen)
+                with self._lock:
+                    self.analysis_seconds += time.perf_counter() - started
+                    deliver = self._record_result_locked(result, gen)
+                if deliver:
+                    self._deliver_sink(result)
+                return result
+            finally:
+                with self._completion:
+                    self._sync_threads.remove(ident)
+                    if self._state == WorkerState.CLOSING and not self._sync_threads:
+                        self._state = WorkerState.CLOSED
+                    self._completion.notify_all()
 
         if to_deliver is not None:
             self._deliver_sink(to_deliver)
@@ -403,6 +462,10 @@ class FeatureAnalysisWorker:
             if to_deliver is not None:
                 self._deliver_sink(to_deliver)
 
+        with self._completion:
+            self._state = WorkerState.CLOSED
+            self._completion.notify_all()
+
     def cancel(self) -> None:
         """Cancel and drain all pending unstarted jobs from the queue."""
         with self._lock:
@@ -452,6 +515,24 @@ class FeatureAnalysisWorker:
                 return
             self._state = WorkerState.CLOSING
             enqueued = self._sentinel_enqueued
+            reentrant = threading.get_ident() in self._sync_threads or threading.current_thread() is self._thread
+
+        # A callback cannot synchronously drain itself. Closing is deferred;
+        # completion of the outer admission/worker loop performs the transition.
+        if reentrant:
+            if not drain:
+                self.cancel()
+            return
+
+        if self._synchronous:
+            with self._completion:
+                while self._sync_threads:
+                    remaining = deadline-time.monotonic()
+                    if remaining <= 0:
+                        raise TimeoutError('Synchronous analysis/delivery drain timed out; worker remains CLOSING')
+                    self._completion.wait(remaining)
+                self._state = WorkerState.CLOSED
+            return
 
         if not self._synchronous and self._thread is not None and self._thread.is_alive():
             if not drain:

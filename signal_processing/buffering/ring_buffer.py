@@ -99,6 +99,21 @@ class CircularIQBuffer:
             )
         if not np.all(np.isfinite(arr)):
             raise ValueError("IQ data must contain only finite values (no NaN or Inf)")
+        self._write_validated(int(start_sample), arr)
+
+    def write_received(self, block) -> None:
+        """Append a validated immutable IQBlock, without rescanning its samples.
+
+        IQBlock construction checks coordinates, dtype, shape and finiteness and
+        freezes the backing storage. Continuity is still checked at this commit.
+        The general array write API retains its full validation boundary.
+        """
+        from signal_processing.core import IQBlock
+        if not isinstance(block, IQBlock):
+            raise TypeError('write_received requires an immutable IQBlock')
+        self._write_validated(block.start_sample, block.iq)
+
+    def _write_validated(self, start_sample: int, arr: np.ndarray) -> None:
         n = len(arr)
         if n == 0:
             return

@@ -355,10 +355,9 @@ class EventAssembler:
         # Derive event timestamp from anchor if available
         event_ts_ns: int | None = None
         if self._anchor_start_sample is not None and self._anchor_timestamp_ns is not None:
+            from signal_processing.core.timebase import sample_offset_ns
             offset = act_start - self._anchor_start_sample
-            event_ts_ns = self._anchor_timestamp_ns + int(
-                round(offset * 1e9 / self._stream_info.sample_rate_hz)
-            )
+            event_ts_ns = self._anchor_timestamp_ns + sample_offset_ns(offset, self._stream_info.sample_rate_hz)
 
         req_lead = self._trigger_sample - self._requested_event_start
         act_lead = trig - act_start
