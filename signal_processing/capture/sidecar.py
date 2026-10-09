@@ -41,6 +41,7 @@ class CaptureSidecar:
     analysis_result: AnalysisResult | None = None
     reopened_count: int = 0
     processing_generation: int | None = None
+    detection_profile_id: str | None = None
 
     def with_features(
         self,
@@ -77,4 +78,5 @@ class CaptureSidecar:
             analysis_result=analysis_result if analysis_result is not None else self.analysis_result,
             reopened_count=self.reopened_count,
             processing_generation=self.processing_generation,
+            detection_profile_id=self.detection_profile_id,
         )

@@ -60,6 +60,7 @@ class FeatureAggregator:
 
         self._registry = registry
         self._feature_schema_version = feature_schema_version
+        self._resolved_policy_cache = None  # One immutable configuration, never event IQ/results.
 
     @property
     def registry(self) -> FeatureRegistry:
@@ -215,11 +216,15 @@ class FeatureAggregator:
             "extractor_versions": {ext.name: ext.version for ext in self._registry.extractors},
             "feature_names": sorted(vector.features.keys()),
         }
-        cfg_json = json.dumps(canonical_dict, sort_keys=True)
-        policy_hash = hashlib.sha256(cfg_json.encode("utf-8")).hexdigest()[:12]
-        policy_id = f"policy_{self._feature_schema_version}_{policy_hash}"
-
-        policy = ExtractionPolicy(policy_id=policy_id, **canonical_dict)
+        cached = self._resolved_policy_cache
+        if cached is not None and cached[0] == canonical_dict:
+            policy = cached[1]
+        else:
+            cfg_json = json.dumps(canonical_dict, sort_keys=True)
+            policy_hash = hashlib.sha256(cfg_json.encode("utf-8")).hexdigest()[:12]
+            policy_id = f"policy_{self._feature_schema_version}_{policy_hash}"
+            policy = ExtractionPolicy(policy_id=policy_id, **canonical_dict)
+            self._resolved_policy_cache = (canonical_dict, policy)
 
         return AnalysisResult(
             feature_vector=vector,

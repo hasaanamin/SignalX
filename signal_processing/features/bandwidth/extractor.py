@@ -36,6 +36,7 @@ class BandwidthFeatureExtractor:
                 f"Expected BandwidthFeatureConfig instance or None, got {type(config).__name__}"
             )
         self.config = config
+        self._resolved_context_config = None
 
     def resolve_config(self, context: SignalContext | Any) -> BandwidthFeatureConfig:
         """The single effective configuration used by both extraction and hashing."""
@@ -43,11 +44,18 @@ class BandwidthFeatureExtractor:
             return self.config
         from dataclasses import fields
         context_config = getattr(context, "config", None)
+        from signal_processing.context import AnalysisConfig
+        cached = self._resolved_context_config
+        if isinstance(context_config, AnalysisConfig) and cached is not None and cached[0] == context_config:
+            return cached[1]
         defaults = BandwidthFeatureConfig()
-        return BandwidthFeatureConfig(**{
+        resolved = BandwidthFeatureConfig(**{
             f.name: getattr(context_config, "bandwidth_" + f.name, getattr(defaults, f.name))
             for f in fields(defaults)
         })
+        if isinstance(context_config, AnalysisConfig):
+            self._resolved_context_config = (context_config, resolved)
+        return resolved
 
     def _make_invalid_featureset(self, reason: str) -> FeatureSet:
         """Create a FeatureSet with all features marked invalid."""

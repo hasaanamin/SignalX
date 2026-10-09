@@ -1414,9 +1414,20 @@ class ExtractionPolicy:
 
     def to_dict(self) -> dict:
         """Canonical JSON-ready policy with no mutable aliases to this record."""
-        import json
-        from dataclasses import asdict
-        return json.loads(json.dumps(asdict(self)))
+        # The schema contains immutable scalars, two scalar tuples and one
+        # string-to-string mapping. Deepcopy + JSON encode/decode adds no
+        # isolation here; allocate only the actual mutable containers required
+        # by the public JSON-ready result. Keep field enumeration schema-driven.
+        from dataclasses import fields
+        result = {}
+        for item in fields(self):
+            value = getattr(self, item.name)
+            if isinstance(value, tuple):
+                value = list(value)
+            elif isinstance(value, Mapping):
+                value = dict(value)
+            result[item.name] = value
+        return result
 
     @classmethod
     def from_dict(cls, record: Mapping) -> ExtractionPolicy:

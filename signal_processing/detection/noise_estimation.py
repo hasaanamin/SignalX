@@ -771,8 +771,12 @@ class AdaptiveRobustNoiseEstimator(NoiseEstimatorProtocol, Resettable):
                 reason=reason,
             )
 
+        key = (sid, block_sequence_number, self._noise_power_linear, self.reference_domain)
+        cached = getattr(self, '_estimate_cache', None)
+        if cached is not None and cached[0] == key:
+            return cached[1]
         noise_dbfs = 10.0 * math.log10(self._noise_power_linear)
-        return NoiseEstimate(
+        estimate = NoiseEstimate(
             stream_id=sid,
             block_sequence_number=block_sequence_number,
             noise_power_dbfs=noise_dbfs,
@@ -780,6 +784,8 @@ class AdaptiveRobustNoiseEstimator(NoiseEstimatorProtocol, Resettable):
             reason=None,
             reference_domain=self.reference_domain,
         )
+        self._estimate_cache = (key, estimate)
+        return estimate
 
     def update_samples(self, samples_iq: np.ndarray) -> None:
         """Update adaptation with confirmed idle noise samples without burst contamination.
@@ -812,8 +818,19 @@ class AdaptiveRobustNoiseEstimator(NoiseEstimatorProtocol, Resettable):
             chunk = combined[i * m : (i + 1) * m]
             c128 = chunk.astype(np.complex128)
             mag_sq = np.real(c128) ** 2 + np.imag(c128) ** 2
-            med_p = float(np.median(mag_sq))
-            mean_p = float(np.mean(mag_sq))
+            # Fixed finite 1-D statistic. Avoid NumPy's general axis/dtype/NaN
+            # dispatch per short update; preserve its exact middle order values
+            # and direct mean (never cumulative-subtraction window power).
+            mean_p = float(mag_sq.mean())
+            middle = m // 2
+            if m % 2:
+                mag_sq.partition(middle)
+                med_p = float(mag_sq[middle])
+            else:
+                mag_sq.partition((middle-1,middle))
+                med_p = (float(mag_sq[middle-1])+float(mag_sq[middle])) / 2.0
+            if math.isnan(mean_p):
+                med_p = float('nan')  # Preserve np.median's NaN propagation.
             sigma2_est = min(med_p / math.log(2.0), mean_p)
             if sigma2_est <= 0.0 or not math.isfinite(sigma2_est):
                 self._samples_since_last_accepted += m

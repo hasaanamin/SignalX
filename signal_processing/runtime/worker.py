@@ -5,6 +5,7 @@ from __future__ import annotations
 import collections
 import dataclasses
 import enum
+import math
 import queue
 import threading
 import time
@@ -46,12 +47,27 @@ class FeatureAnalysisWorker:
         result_sink: Callable[[CaptureSidecar], None] | None = None,
         analysis_function: Callable[[SignalContext], AnalysisResult] | None = None,
         result_delivery: str = "polling",
+        analysis_backend: str = "thread",
+        process_timeout: float = 30.0,
+        process_workers: int = 4,
+        result_order: str = 'submission',
     ) -> None:
         if isinstance(max_queue_size, bool) or not isinstance(max_queue_size, int) or max_queue_size < 1:
             raise ValueError(f"max_queue_size must be an integer >= 1, got {max_queue_size!r}")
         if isinstance(max_results, bool) or not isinstance(max_results, int) or max_results < 1:
             raise ValueError(f"max_results must be an integer >= 1, got {max_results!r}")
 
+        if analysis_backend not in ('thread', 'process', 'process_pool'):
+            raise ValueError('analysis_backend must be thread, process or process_pool')
+        if analysis_backend != 'thread' and (synchronous or analysis_function is not None):
+            raise ValueError('Process backend requires asynchronous default analysis; custom callbacks use thread backend')
+        if type(process_workers) is not int or not 1<=process_workers<=4:
+            raise ValueError('process_workers must be an integer from 1 to 4')
+        if result_order not in ('submission','completion'):
+            raise ValueError('result_order must be submission or completion')
+        if result_order!='submission' and analysis_backend!='process_pool':
+            raise ValueError('Completion-order delivery requires process_pool backend')
+        self._result_order=result_order
         self._max_queue_size = int(max_queue_size)
         self._max_results = int(max_results)
         if result_delivery not in ('polling', 'callbacks'):
@@ -60,7 +76,7 @@ class FeatureAnalysisWorker:
         self._polling_reserved = 0
         self._skip_incomplete_quality = bool(skip_incomplete_quality)
         self._synchronous = bool(synchronous)
-        self._analysis_config = analysis_config
+        self._analysis_config = analysis_config if analysis_config is not None else AnalysisConfig()
         self._result_sink = result_sink
         self._analysis_function = analysis_function
         self._cancellation_operations = 0
@@ -82,19 +98,92 @@ class FeatureAnalysisWorker:
         self._sink_error_count: int = 0
         self.analysis_seconds = 0.0
         self.sink_seconds = 0.0
+        self.parent_worker_cpu_seconds = 0.0
         self._processed_results: collections.deque[CaptureSidecar] = collections.deque(maxlen=self._max_results)
         self._lock = threading.Lock()
         self._completion = threading.Condition(self._lock)
         # At most max_queue_size concurrent synchronous callers; each remains
         # admitted through result storage AND out-of-lock callback delivery.
         self._sync_threads: set[int] = set()
+        self._async_outstanding = 0  # Accepted jobs, never control sentinels.
         self._sentinel_enqueued: bool = False
 
         self._thread: threading.Thread | None = None
+        self._process_backend = None
+        self._backend_cleanup_error = None
+        self._parallel_processes = analysis_backend == 'process_pool'
+        self._wake_receiver = self._wake_sender = None
+        self._readiness = None
+        self._wake_pending = False
+        self.wakeup_errors = 0
+        if analysis_backend == 'process':
+            from signal_processing.runtime.process_analysis import ProcessAnalysisBackend
+            self._process_backend = ProcessAnalysisBackend(timeout=process_timeout)
+            self._analysis_function = self._process_backend
+        elif self._parallel_processes:
+            from signal_processing.runtime.process_analysis import ParallelProcessAnalysisBackend
+            try:
+                import multiprocessing, sys
+                if sys.platform == 'win32':
+                    from signal_processing.runtime._readiness import WindowsReadiness
+                    self._readiness = WindowsReadiness()
+                else:
+                    self._wake_receiver,self._wake_sender=multiprocessing.Pipe(duplex=False)
+                self._process_backend = ParallelProcessAnalysisBackend(timeout=process_timeout,
+                    workers=process_workers, readiness=self._readiness)
+                self._analysis_function = self._process_backend
+            except BaseException:
+                if self._process_backend is not None:self._process_backend.close()
+                if self._readiness is not None:self._readiness.close()
+                if self._wake_receiver is not None:self._wake_receiver.close();self._wake_sender.close()
+                raise
 
         if not self._synchronous:
             self._thread = threading.Thread(target=self._worker_loop, daemon=True, name="FeatureAnalysisWorker")
-            self._thread.start()
+            try:self._thread.start()
+            except BaseException:
+                if self._process_backend is not None:self._process_backend.close()
+                if self._wake_receiver is not None:self._wake_receiver.close();self._wake_sender.close()
+                if self._readiness is not None:self._readiness.close()
+                self._state=WorkerState.CLOSED
+                raise
+
+    def _wake_locked(self):
+        """Coalesce input/lifecycle readiness to ONE bounded internal byte.
+
+        Called under admission lock. The sole receiver consumes that byte under
+        the same lock before clearing the flag; an empty-to-one write cannot
+        fill this pipe. No external callback or IQ is transported here.
+        """
+        if self._readiness is not None:
+            try:self._readiness.set()
+            except OSError:self.wakeup_errors+=1
+        elif self._wake_sender is not None and not self._wake_pending:
+            try:
+                self._wake_sender.send_bytes(b'x')
+                self._wake_pending=True
+            except OSError:
+                self.wakeup_errors+=1  # Affected runs cannot claim clean recovery.
+
+    def _drain_wake(self):
+        with self._lock:
+            if self._readiness is not None:
+                self._readiness.clear()
+            if self._wake_pending:
+                self._wake_receiver.recv_bytes(1)
+                self._wake_pending=False
+
+    @property
+    def backend_pid(self) -> int | None:
+        """Child PID for diagnostics; None for the compatibility thread backend."""
+        return self._process_backend.pid if self._process_backend is not None else None
+
+    @property
+    def backend_pids(self) -> tuple[int, ...]:
+        """Persistent child identities for owned-process diagnostics/placement."""
+        if self._process_backend is None:
+            return ()
+        return getattr(self._process_backend,'pids',(self._process_backend.pid,))
 
     @property
     def state(self) -> WorkerState:
@@ -164,9 +253,13 @@ class FeatureAnalysisWorker:
 
     @property
     def unfinished_work(self) -> int:
-        """Admitted synchronous analysis/delivery or async queued/running work."""
+        """Accepted queued/running work, including required callback delivery.
+
+        Backend teardown is represented by CLOSING until cleanup completes, not
+        an extra fictitious analysis job. CLOSED and zero work prove both drained.
+        """
         with self._lock:
-            return len(self._sync_threads) if self._synchronous else self._queue.unfinished_tasks
+            return len(self._sync_threads) if self._synchronous else self._async_outstanding
 
     def _record_result_locked(self, result: CaptureSidecar, generation: int) -> bool:
         """Store result in bounded deque and result queue under self._lock."""
@@ -238,10 +331,11 @@ class FeatureAnalysisWorker:
                 if generation is None or generation == self._current_generation:
                     if not self._synchronous:
                         self._polling_reserved -= 1
+                    self._completion.notify_all()
                     return result
                 self._discarded_old_generation_count += 1
 
-    def _process_one(self, sidecar: CaptureSidecar) -> CaptureSidecar:
+    def _process_one(self, sidecar: CaptureSidecar, *, prepare_only=False):
         # Quality Gate
         if self._skip_incomplete_quality and not sidecar.event.complete:
             reason = f"Capture incomplete ({sidecar.termination_reason}, dropped={sidecar.known_lost_samples})"
@@ -284,12 +378,15 @@ class FeatureAnalysisWorker:
             context = SignalContext(
                 event=sidecar.event, config=self._analysis_config, capture_quality=cap_quality
             )
+            if prepare_only:
+                return context
             analysis_result: AnalysisResult = (self._analysis_function(context) if self._analysis_function is not None
                                                else self._aggregator.extract_analysis_result(context))
             if not isinstance(analysis_result, AnalysisResult):
                 raise TypeError("analysis_function must return AnalysisResult")
             if self._analysis_function is not None:
-                self._validate_backend_result(analysis_result, context, cap_quality)
+                self._validate_backend_result(analysis_result, context, cap_quality,
+                                              policy_verified=self._process_backend is not None)
             if not sidecar.event.complete:
                 status = "degraded"
                 reason = f"Degraded: incomplete capture extent ({sidecar.termination_reason}, dropped={sidecar.known_lost_samples})"
@@ -314,7 +411,7 @@ class FeatureAnalysisWorker:
             )
 
     @staticmethod
-    def _validate_backend_result(result, context, quality):
+    def _validate_backend_result(result, context, quality, *, policy_verified=False):
         """Validate observable attribution, not arbitrary backend arithmetic.
 
         Custom feature sets/schema and extractor overrides are supported. Context
@@ -329,7 +426,8 @@ class FeatureAnalysisWorker:
             raise ValueError('Backend capture quality/provenance differs from admitted context')
         if policy.schema_version != vector.feature_schema_version or set(policy.feature_names) != set(vector.features):
             raise ValueError('Backend feature schema/names contradict its policy')
-        ExtractionPolicy.from_dict(policy.to_dict())
+        if not policy_verified:
+            ExtractionPolicy.from_dict(policy.to_dict())
         cfg, n = context.config, context.signal_num_samples
         welch = cfg.psd_mode == 'welch'
         nperseg = (cfg.psd_nperseg if cfg.psd_nperseg is not None else min(n, 1024)) if welch else n
@@ -374,9 +472,16 @@ class FeatureAnalysisWorker:
 
             if not self._synchronous:
                 try:
+                    # Parallel service does not enlarge total accepted storage:
+                    # queue capacity + one legacy running-job lease, including
+                    # ordered results waiting for a required sink.
+                    if self._parallel_processes and self._async_outstanding >= self._max_queue_size+1:
+                        raise queue.Full
                     if self._result_delivery == 'polling' and self._polling_reserved >= self._max_results:
                         raise queue.Full
                     self._queue.put_nowait((gen, sidecar))
+                    self._async_outstanding += 1
+                    self._wake_locked()
                     if self._result_delivery == 'polling':
                         self._polling_reserved += 1
                     result_to_return = dataclasses.replace(sidecar, processing_generation=gen)
@@ -417,6 +522,31 @@ class FeatureAnalysisWorker:
         assert result_to_return is not None
         return result_to_return
 
+    def wait_for_capacity(self, timeout: float) -> bool:
+        """Optional bounded downstream backpressure, never called by submit().
+
+        Intended for a separate completion pump, NOT the IQ acquisition caller.
+        This is a readiness observation, not a multi-producer reservation. An
+        absent consumer cannot create unlimited lossless storage: upstream finite
+        buffers eventually fill, with explicit source loss/overload accounting.
+        """
+        if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or not math.isfinite(timeout) or timeout < 0:
+            raise ValueError('Capacity timeout must be finite and nonnegative')
+        deadline = time.monotonic()+float(timeout)
+        with self._completion:
+            while self._state == WorkerState.OPEN:
+                if (not self._queue.full()
+                        and (not self._parallel_processes or self._async_outstanding < self._max_queue_size+1)
+                        and (self._result_delivery != 'polling' or self._polling_reserved < self._max_results)):
+                    return True
+                if threading.current_thread() is self._thread or threading.get_ident() in self._sync_threads:
+                    raise RuntimeError('A callback cannot wait for its own delivery capacity')
+                remaining=deadline-time.monotonic()
+                if remaining<=0:
+                    return False
+                self._completion.wait(remaining)
+            return False
+
     def _safe_process_one(self, sidecar: CaptureSidecar) -> CaptureSidecar:
         """A calculation failure is a terminal result, never a dead worker thread."""
         try:
@@ -426,6 +556,127 @@ class FeatureAnalysisWorker:
                 feature_reason=f"Analysis failed: {type(exc).__name__}: {exc}")
 
     def _worker_loop(self) -> None:
+        cpu_started = time.thread_time()
+        try:
+            if self._parallel_processes:
+                self._run_parallel_jobs()
+            else:
+                self._run_jobs()
+        finally:
+            self.parent_worker_cpu_seconds = time.thread_time()-cpu_started
+            # CLOSED includes child cleanup; timeout callers observe CLOSING
+            # until analysis, callbacks and process termination actually finish.
+            try:
+                if self._process_backend is not None:
+                    self._process_backend.close()
+            except Exception as exc:
+                self._backend_cleanup_error = exc
+            with self._completion:
+                self._state = WorkerState.CLOSING if self._backend_cleanup_error else WorkerState.CLOSED
+                if self._wake_receiver is not None:
+                    self._wake_receiver.close();self._wake_sender.close()
+                    self._wake_receiver=self._wake_sender=None
+                if self._readiness is not None:
+                    self._readiness.close()
+                    self._readiness=None
+                self._completion.notify_all()
+
+    def _run_parallel_jobs(self) -> None:
+        """Four persistent servers; bounded ordered completion, serial sinks.
+
+        No executor/future queue exists. Every transaction belongs to the same
+        accepted-work ledger as queued work, through completion of its sinks.
+        """
+        pending = collections.deque()
+        available = collections.deque(self._process_backend._backends)
+        stopping = False
+        while not stopping or pending:
+                self._drain_wake()
+                while not stopping and available and len(pending) < len(self._process_backend._backends):
+                    try:
+                        item = self._queue.get_nowait() if pending else self._queue.get(timeout=0.1)
+                    except queue.Empty:
+                        with self._lock:
+                            stopping = self._state != WorkerState.OPEN and self._queue.empty()
+                        break
+                    if item is _SENTINEL:
+                        self._queue.task_done()
+                        with self._lock:
+                            self._sentinel_enqueued = False
+                        stopping = True
+                        break
+                    gen, sidecar = item
+                    backend = available.popleft()
+                    context = None
+                    result = None
+                    try:
+                        context = self._process_one(sidecar, prepare_only=True)
+                        result = context if isinstance(context, CaptureSidecar) else None
+                        if result is None:
+                            backend.begin(context)
+                    except Exception as exc:
+                        result = sidecar.with_features(features=None, feature_status='failed',
+                            feature_reason=f'Analysis failed: {type(exc).__name__}: {exc}')
+                    pending.append((gen, time.perf_counter(), backend, sidecar, context, result))
+                if not pending:
+                    continue
+                selected=0
+                if self._result_order=='completion':
+                    # Bounded scan (<=4). Independent immutable event jobs may
+                    # finish out of order only under this explicit opt-in. Fast
+                    # servers can then accept work without waiting for a slow
+                    # predecessor. Sinks themselves remain strictly serial.
+                    for i,item in enumerate(pending):
+                        try:ready=item[5] is not None or item[2].ready()
+                        except Exception:ready=True  # Controlled failure below.
+                        if ready:
+                            selected=i
+                            break
+                gen, started, backend, sidecar, context, result = pending[selected]
+                if result is None:
+                    try:
+                        if not backend.ready():
+                            # Wake on ANY eligible completed server or new input,
+                            # not a polling timer tied to the oldest transaction.
+                            if self._readiness is not None:
+                                self._readiness.wait(.05)
+                            else:
+                                from multiprocessing.connection import wait
+                                connections=([item[2]._connection for item in pending if item[5] is None]
+                                    if self._result_order=='completion' else [backend._connection])
+                                wait([*connections,self._wake_receiver],timeout=.05)
+                            continue
+                    except Exception as exc:
+                        result = sidecar.with_features(features=None, feature_status='failed',
+                            feature_reason=f'Analysis transport failed: {type(exc).__name__}: {exc}')
+                del pending[selected]
+                try:
+                    if result is None:
+                        try:
+                            analysis = backend.finish()
+                            self._validate_backend_result(analysis, context, context.capture_quality, policy_verified=True)
+                            degraded = not sidecar.event.complete or not sidecar.noise_valid
+                            result = sidecar.with_features(features=analysis.feature_vector,
+                                analysis_result=analysis, feature_status='degraded' if degraded else 'ok',
+                                feature_reason=(f'Degraded capture: {sidecar.termination_reason}; noise_valid={sidecar.noise_valid}'
+                                                if degraded else None))
+                        except Exception as exc:
+                            result = sidecar.with_features(features=None, feature_status='failed',
+                                feature_reason=f'Analysis failed: {type(exc).__name__}: {exc}')
+                    result = dataclasses.replace(result, processing_generation=gen)
+                    with self._lock:
+                        self.analysis_seconds += time.perf_counter()-started
+                        deliver = self._record_result_locked(result, gen)
+                    if deliver:
+                        self._deliver_sink(result)
+                finally:
+                    available.append(backend)
+                    self._queue.task_done()
+                    with self._completion:
+                        self._async_outstanding -= 1
+                        self._completion.notify_all()
+
+    def _run_jobs(self) -> None:
         while True:
             try:
                 item = self._queue.get(timeout=0.1)
@@ -456,15 +707,16 @@ class FeatureAnalysisWorker:
                 with self._lock:
                     if self._record_result_locked(result, gen):
                         to_deliver = result
+                if to_deliver is not None:
+                    self._deliver_sink(to_deliver)
             finally:
+                # A dequeued job is outstanding through required delivery.
+                # Callbacks remain outside lifecycle locks and can reset/close.
                 self._queue.task_done()
-
-            if to_deliver is not None:
-                self._deliver_sink(to_deliver)
-
-        with self._completion:
-            self._state = WorkerState.CLOSED
-            self._completion.notify_all()
+                if item is not _SENTINEL:
+                    with self._completion:
+                        self._async_outstanding -= 1
+                        self._completion.notify_all()
 
     def cancel(self) -> None:
         """Cancel and drain all pending unstarted jobs from the queue."""
@@ -476,6 +728,7 @@ class FeatureAnalysisWorker:
                     item = self._queue.get_nowait()
                     if item is not _SENTINEL:
                         cancelled += 1
+                        self._async_outstanding -= 1
                         if self._result_delivery == 'polling' and item[0] == self._current_generation:
                             self._polling_reserved -= 1
                     else:
@@ -484,16 +737,20 @@ class FeatureAnalysisWorker:
                 except queue.Empty:
                     break
             self._cancelled_count += cancelled
+            self._wake_locked()
+            self._completion.notify_all()
 
     def advance_generation(self) -> int:
         """Explicit cancellation barrier; ordinary raw acquisition gaps must not call this."""
         with self._lock:
             self._cancellation_operations += 1
             self._current_generation += 1
+            self._wake_locked()
             self._polling_reserved = 0
             while not self._result_queue.empty():
                 self._result_queue.get_nowait()
                 self._discarded_old_generation_count += 1
+            self._completion.notify_all()
             return self._current_generation
 
     def shutdown(self, drain: bool = True, timeout: float = 5.0) -> None:
@@ -514,6 +771,7 @@ class FeatureAnalysisWorker:
             if self._state == WorkerState.CLOSED:
                 return
             self._state = WorkerState.CLOSING
+            self._wake_locked()
             enqueued = self._sentinel_enqueued
             reentrant = threading.get_ident() in self._sync_threads or threading.current_thread() is self._thread
 
@@ -553,10 +811,15 @@ class FeatureAnalysisWorker:
             if self._thread.is_alive():
                 raise TimeoutError(f"FeatureAnalysisWorker shutdown timed out after {timeout} seconds")
 
+        if self._process_backend is not None:
+            self._process_backend.close()
+            self._backend_cleanup_error = None
         with self._lock:
             while not self._queue.empty():
                 try:
-                    self._queue.get_nowait()
+                    item = self._queue.get_nowait()
+                    if item is not _SENTINEL:
+                        self._async_outstanding -= 1
                     self._queue.task_done()
                 except (queue.Empty, ValueError):
                     break
@@ -575,6 +838,7 @@ class FeatureAnalysisWorker:
                     item = self._queue.get_nowait()
                     if item is not _SENTINEL:
                         cancelled += 1
+                        self._async_outstanding -= 1
                     self._queue.task_done()
                 except queue.Empty:
                     break
@@ -591,3 +855,5 @@ class FeatureAnalysisWorker:
             self._discarded_old_generation_count = 0
             self._sink_error_count = 0
             self._processed_results.clear()
+            self._wake_locked()
+            self._completion.notify_all()

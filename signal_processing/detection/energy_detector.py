@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+from dataclasses import dataclass
 from typing import Literal
 
 import numpy as np
@@ -12,13 +13,48 @@ from scipy.stats import gamma
 from signal_processing.core.contracts import DetectionMeasurement, IQBlock, NoiseEstimate, NoiseReferenceDomain
 from signal_processing.core.interfaces import DetectorProtocol, Resettable
 from signal_processing.core.exceptions import StreamConsistencyError
+from signal_processing.core.stream_compatibility import require_stream, same_sample_rate
 from signal_processing.detection.exceptions import (
     FilterConfigurationError,
     PolicyCompatibilityError,
     UncalibratedNoiseError,
 )
 from signal_processing.detection.noise_estimation import ThresholdPolicy
-from signal_processing.detection._power import window_mean_power
+from signal_processing.detection._power import window_mean_power, window_mean_powers
+
+
+@dataclass(frozen=True)
+class _QuietFullBandBatch:
+    """Private one-use preparation. It owns no committed stream progress."""
+
+    owner: object
+    block: IQBlock
+    prior_residual: np.ndarray
+    prior_input_end: int | None
+    prior_next_window: int
+    prior_policy: object
+    combined: np.ndarray
+    origin: int
+    retained_start: int
+    last_power: float
+    thresholds: tuple
+
+
+@dataclass
+class _FullBandCursor:
+    """Call-local numerical lookahead; only commit advances streaming state."""
+
+    owner: object
+    block: IQBlock
+    combined: np.ndarray
+    origin: int
+    first: int
+    powers: tuple[float, ...]
+    index: int
+    expected_end: int | None
+    expected_residual: np.ndarray
+    expected_next: int
+    policy: object
 
 
 class EnergyDetector(DetectorProtocol, Resettable):
@@ -273,7 +309,7 @@ class EnergyDetector(DetectorProtocol, Resettable):
     def _validate_input(self, block: IQBlock) -> None:
         if not isinstance(block, IQBlock):
             raise TypeError("Expected a validated immutable IQBlock")
-        if not math.isclose(block.stream.sample_rate_hz, self._sample_rate_hz, rel_tol=1e-12):
+        if not same_sample_rate(block.stream.sample_rate_hz, self._sample_rate_hz):
             raise PolicyCompatibilityError("Input sample rate differs from detector sample rate")
         # IQBlock guarantees finite complex64 storage backed by immutable bytes.
         # Re-scanning every overlapping hop adds no validation at this boundary.
@@ -285,7 +321,8 @@ class EnergyDetector(DetectorProtocol, Resettable):
         if block.dropped_samples_before or block.overflow:
             raise StreamConsistencyError("Direct detector discontinuity requires explicit reset and a clean new-epoch block")
         if self._input_end is not None:
-            if block.start_sample != self._input_end or block.stream != self._input_stream:
+            require_stream(block.stream, self._input_stream)
+            if block.start_sample != self._input_end:
                 raise StreamConsistencyError("Detector input is not contiguous in the same stream; reset required")
             # Repeated sequence numbers allow subdivisions of one transport block.
             # Jumps are legal if sample coordinates remain continuous.
@@ -349,6 +386,21 @@ class EnergyDetector(DetectorProtocol, Resettable):
         return 10*math.log10(on), 10*math.log10(off), noise, db
 
     def _linear_thresholds(self, noise_estimate: NoiseEstimate, window_size: int | None = None):
+        # One-entry identity cache: immutable references commonly repeat for all
+        # hops in a transport block. Strict support still checks its live settling
+        # horizon on every call. No recording-length cache or rounded-power key.
+        n = self._window_size if window_size is None else window_size
+        cached = getattr(self, '_threshold_cache', None)
+        if (not self._require_supported_pfa and cached is not None
+                and cached[0] is noise_estimate and cached[1] is self._threshold_policy
+                and cached[2] is self.reference_domain and cached[3] == n):
+            return cached[4]
+        result = self._uncached_linear_thresholds(noise_estimate, window_size)
+        if not self._require_supported_pfa:
+            self._threshold_cache = (noise_estimate, self._threshold_policy, self.reference_domain, n, result)
+        return result
+
+    def _uncached_linear_thresholds(self, noise_estimate: NoiseEstimate, window_size: int | None = None):
         if not noise_estimate.valid or not math.isfinite(noise_estimate.noise_power_dbfs):
             raise UncalibratedNoiseError(
                 f"Cannot compute detection thresholds: noise estimate is invalid or non-finite "
@@ -568,6 +620,129 @@ class EnergyDetector(DetectorProtocol, Resettable):
 
         self._commit_input(block, 'streaming')
         return measurements
+
+    def _is_quiet_full_band(self, block: IQBlock, noise_estimate: NoiseEstimate) -> bool:
+        """Pure lookahead for the pipeline's fixed-reference idle optimization.
+
+        Does not admit samples or mutate residual/filter/reference state. Requires
+        all complete windows below OFF (hence also below ON). The caller still
+        uses process_windows for actual validation and committed processing.
+        """
+        return self._prepare_quiet_full_band(block, noise_estimate) is not None
+
+    def _prepare_full_band(self, block: IQBlock) -> _FullBandCursor:
+        """Bounded pure preparation for active as well as quiet pipeline input.
+
+        No thresholds, adaptation, filter progress or received/committed clocks
+        are advanced. Every reduction uses only its own stored complex64 window.
+        Configured filtering intentionally retains the reference execution path.
+        """
+        if self._mode != 'full_band' or block.num_samples > 4096:
+            raise ValueError('Full-band preparation requires at most 4096 samples')
+        self._validate_continuity(block, 'streaming')
+        combined = np.concatenate((self._residual_iq, block.iq)) if len(self._residual_iq) else block.iq
+        origin = self._residual_start_sample if len(self._residual_iq) else block.start_sample
+        first = max(0, self._next_window_sample-origin)
+        values = combined.astype(np.complex128)
+        powers = tuple(map(float, window_mean_powers(values[first:], self._window_size, self._hop_size)))
+        return _FullBandCursor(self, block, combined, origin, first, powers, 0,
+                              self._input_end, self._residual_iq, self._next_window_sample,
+                              self._threshold_policy)
+
+    def _commit_full_band(self, cursor, block, noise_estimate, *, quiet=False, active=False, idle=False):
+        """Commit only the next received prefix, with the reference valid NOW.
+
+        A failed threshold check leaves the cursor and detector untouched. Future
+        IQ in the preparation never enters detector residuals or input clocks.
+        Quiet collapsing is authorized only by the pipeline's idle/fixed guard.
+        """
+        if (cursor.owner is not self or cursor.expected_end != self._input_end
+                or cursor.expected_residual is not self._residual_iq
+                or cursor.expected_next != self._next_window_sample
+                or cursor.policy is not self._threshold_policy):
+            raise StreamConsistencyError('Stale or foreign full-band preparation')
+        expected = cursor.block.start_sample if cursor.expected_end is None else cursor.expected_end
+        if block.start_sample != expected or block.end_sample > cursor.block.end_sample:
+            raise StreamConsistencyError('Prepared commit must be the next bounded prefix')
+        self._validate_continuity(block, 'streaming')
+        if not noise_estimate.valid or not math.isfinite(noise_estimate.noise_power_dbfs):
+            raise UncalibratedNoiseError('Cannot commit windows with an invalid noise reference')
+        thresholds = self._linear_thresholds(noise_estimate)
+        stop = min(len(cursor.powers), max(0, (block.end_sample-cursor.origin-cursor.first-self._window_size)//self._hop_size+1))
+        if quiet and any(p >= thresholds[1] for p in cursor.powers[cursor.index:stop]):
+            raise ValueError('Cannot collapse nonquiet decisions')
+        if idle and any(p >= thresholds[0] for p in cursor.powers[cursor.index:stop]):
+            raise ValueError('Cannot collapse above-ON idle decisions')
+        if active and any(p < thresholds[1] for p in cursor.powers[cursor.index:stop]):
+            raise ValueError('Cannot collapse a below-OFF active decision')
+        indices = range(max(cursor.index, stop-1) if quiet or active or idle else cursor.index, stop)
+        measurements = [self._measurement(block, cursor.origin+cursor.first+i*self._hop_size,
+                        cursor.origin+cursor.first+i*self._hop_size+self._window_size,
+                        cursor.powers[i], thresholds) for i in indices]
+        retained = cursor.first+stop*self._hop_size
+        self._residual_iq = cursor.combined[retained:block.end_sample-cursor.origin].copy()
+        self._residual_start_sample = cursor.origin+retained
+        self._next_window_sample = self._residual_start_sample
+        self._last_detection_iq = block.iq
+        self._commit_input(block, 'streaming')
+        cursor.index, cursor.expected_end = stop, self._input_end
+        cursor.expected_residual, cursor.expected_next = self._residual_iq, self._next_window_sample
+        return measurements
+
+    def _prepare_quiet_full_band(self, block: IQBlock, noise_estimate: NoiseEstimate):
+        """Compute every eligible quiet power once, without state commitment.
+
+        Used only by the pipeline's bounded, fixed-reference idle fast path.
+        Nonquiet input falls back to the ordinary chronological execution path.
+        The prepared object is consumed immediately, never cached across calls.
+        """
+        if self._mode != 'full_band':
+            return None
+        self._validate_continuity(block, 'streaming')
+        if not noise_estimate.valid or not math.isfinite(noise_estimate.noise_power_dbfs):
+            raise UncalibratedNoiseError('Cannot prepare windows with an invalid noise reference')
+        thresholds = self._linear_thresholds(noise_estimate)
+        off = thresholds[1]
+        combined = np.concatenate((self._residual_iq, block.iq)) if len(self._residual_iq) else block.iq
+        origin = self._residual_start_sample if len(self._residual_iq) else block.start_sample
+        first = max(0, self._next_window_sample-origin)
+        values = combined.astype(np.complex128)
+        count = 0
+        for start in range(first, len(values)-self._window_size+1, self._hop_size):
+            power = window_mean_power(values[start:start+self._window_size])
+            if not math.isfinite(power) or power < 0:
+                raise ValueError('Unrepresentable physical window power')
+            if power >= off:
+                return None
+            count += 1
+        if not count:
+            return None
+        return _QuietFullBandBatch(self, block, self._residual_iq, self._input_end,
+            self._next_window_sample, self._threshold_policy, combined, origin,
+            first+count*self._hop_size, power, thresholds)
+
+    def _commit_quiet_full_band(self, prepared: _QuietFullBandBatch) -> DetectionMeasurement:
+        """Commit a validated quiet preparation, returning only its last decision.
+
+        Only an idle segmenter without an in-flight capture may collapse these
+        strictly-below-OFF decisions. Public process_windows still returns all
+        windows. Reject stale/foreign preparations before any streaming mutation.
+        """
+        if (prepared.owner is not self or prepared.prior_residual is not self._residual_iq
+                or prepared.prior_input_end != self._input_end
+                or prepared.prior_next_window != self._next_window_sample
+                or prepared.prior_policy is not self._threshold_policy):
+            raise StreamConsistencyError('Stale or foreign quiet-window preparation')
+        self._validate_continuity(prepared.block, 'streaming')
+        start = prepared.origin+prepared.retained_start-self._hop_size
+        measurement = self._measurement(prepared.block, start, start+self._window_size,
+                                        prepared.last_power, prepared.thresholds)
+        self._residual_iq = prepared.combined[prepared.retained_start:].copy()
+        self._residual_start_sample = prepared.origin+prepared.retained_start
+        self._next_window_sample = self._residual_start_sample
+        self._last_detection_iq = prepared.block.iq
+        self._commit_input(prepared.block, 'streaming')
+        return measurement
 
     def reset(self) -> None:
         """Reset internal streaming filter and windowing state."""
