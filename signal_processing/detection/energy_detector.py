@@ -82,6 +82,9 @@ class EnergyDetector(DetectorProtocol, Resettable):
         threshold_policy: ThresholdPolicy | None = None,
         gain_id: str = "digital_iq_unity",
         require_supported_pfa: bool = False,
+        ar1_model=None,
+        ar1_windows: tuple[int, ...] = (),
+        ar1_subbands: int = 0,
     ) -> None:
         if isinstance(window_size, bool) or not isinstance(window_size, (int, np.integer)) or window_size < 1:
             raise ValueError(f"window_size must be >= 1, got {window_size!r}")
@@ -117,6 +120,30 @@ class EnergyDetector(DetectorProtocol, Resettable):
         self._monitored_band_hz = tuple(monitored_band_hz) if monitored_band_hz is not None else None
         self._sample_rate_hz = float(sample_rate_hz)
         self._conversion_floor = float(conversion_floor_linear)
+        if ar1_model is not None:
+            from .ar_noise import AR1NoiseModel
+            if not isinstance(ar1_model, AR1NoiseModel) or ar1_model.sample_rate_hz != float(sample_rate_hz):
+                raise ValueError("A fitted AR1 model with matching sample rate is required")
+            if mode != "full_band":
+                raise ValueError("AR1 whitening plus configured SOS filtering is not yet supported")
+        self._ar1_model = ar1_model
+        self._ar1_previous = None
+        if ar1_windows and (ar1_model is None or threshold_policy is not None):
+            raise ValueError("AR1 bank requires its fitted model and currently supports model-only thresholds")
+        if (not isinstance(ar1_windows, tuple) or len(ar1_windows)>3
+                or len(set(ar1_windows)) != len(ar1_windows)
+                or any(type(n) is not int or not hop_size <= n <= window_size for n in ar1_windows)):
+            raise ValueError("AR1 bank must contain at most three distinct N between H and primary N")
+        self._ar1_windows = ar1_windows
+        if type(ar1_subbands) is not int or ar1_subbands not in (0,8) or (ar1_subbands and (32 not in ar1_windows or window_size != 256)):
+            raise ValueError("Spectral candidate requires a 256-sample AR1 bank and 8 fixed subbands")
+        self._ar1_subbands = ar1_subbands
+        tests = len(ar1_windows)+ar1_subbands
+        self._ar1_quantiles = {n:(float(gamma.isf(pfa_on/tests,a=n,scale=1/n)),
+                                  float(gamma.isf(pfa_off/tests,a=n,scale=1/n)))
+                               for n in ar1_windows}
+        if ar1_subbands:
+            self._ar1_band_bins = tuple((np.arange(c-16,c+16)%256) for c in range(0,256,32))
 
         self._unit_q_on = float(gamma.isf(self._pfa_on, a=self._window_size, scale=1.0 / self._window_size))
         self._unit_q_off = float(gamma.isf(self._pfa_off, a=self._window_size, scale=1.0 / self._window_size))
@@ -141,7 +168,8 @@ class EnergyDetector(DetectorProtocol, Resettable):
             self._init_configured_band_filter(filter_order)
 
         self.reference_domain = NoiseReferenceDomain(
-            self._sample_rate_hz, self._monitored_band_hz, self._sos_hash, gain_id
+            self._sample_rate_hz, self._monitored_band_hz, self._sos_hash, gain_id,
+            ar1_model.model_id if ar1_model is not None else None,
         )
         self._require_supported_pfa = require_supported_pfa
         self._threshold_policy: ThresholdPolicy | None = None
@@ -152,6 +180,8 @@ class EnergyDetector(DetectorProtocol, Resettable):
 
     def set_threshold_policy(self, policy: ThresholdPolicy) -> None:
         """Set and validate an empirical or analytic threshold policy."""
+        if self._ar1_windows:
+            raise PolicyCompatibilityError("AR1 bank evidence cannot be replaced by a single-window certificate")
         if not isinstance(policy, ThresholdPolicy):
             raise TypeError(f"policy must be a ThresholdPolicy instance, got {type(policy).__name__}")
         if not policy.valid:
@@ -304,6 +334,8 @@ class EnergyDetector(DetectorProtocol, Resettable):
     def threshold_model(self) -> str:
         if self._threshold_policy is not None:
             return self._threshold_policy.mode
+        if self._ar1_model is not None:
+            return "fitted_ar1_innovation_gamma_union_model" if self._ar1_windows else "fitted_ar1_innovation_gamma_model"
         return "stationary_gaussian_quadratic_bound" if self._mode == "configured_band" else "iid_complex_gaussian_gamma"
 
     def _validate_input(self, block: IQBlock) -> None:
@@ -408,6 +440,8 @@ class EnergyDetector(DetectorProtocol, Resettable):
             )
 
         p_noise_dbfs = float(noise_estimate.noise_power_dbfs)
+        if self._ar1_model is not None and noise_estimate.reference_domain is None:
+            raise PolicyCompatibilityError("AR1 detection requires an explicitly tagged innovation reference")
         if noise_estimate.reference_domain is not None and noise_estimate.reference_domain != self.reference_domain:
             raise PolicyCompatibilityError("Noise reference domain differs from detector path/gain")
         try:
@@ -465,7 +499,7 @@ class EnergyDetector(DetectorProtocol, Resettable):
         # remain strict Python bools in the public measurement contract.
         return float(t_on_lin), float(t_off_lin), p_noise_lin, p_noise_dbfs
 
-    def _measurement(self, block, start, end, power, thresholds):
+    def _measurement(self, block, start, end, power, thresholds, measurement_domain=None):
         on, off, noise, noise_db = thresholds
         if not math.isfinite(power) or power < 0:
             raise ValueError("Unrepresentable physical window power")
@@ -477,6 +511,7 @@ class EnergyDetector(DetectorProtocol, Resettable):
             snr_estimate_db=10*(math.log10(power-noise)-math.log10(noise)) if power > noise else 0.0,
             snr_valid=power > noise,
             snr_invalid_reason=None if power > noise else 'nonpositive_excess',
+            measurement_domain=measurement_domain or ('ar1_innovation_power' if self._ar1_model else 'iq_power'),
             on_threshold_dbfs=10*math.log10(on), off_threshold_dbfs=10*math.log10(off),
             above_on_threshold=power >= on, below_off_threshold=power < off,
             signal_power_linear=power, noise_power_linear=noise,
@@ -496,6 +531,17 @@ class EnergyDetector(DetectorProtocol, Resettable):
 
     def _prepare_detection_iq(self, iq: np.ndarray) -> np.ndarray:
         """Apply frequency mixing and filtering if configured_band mode is active."""
+        if self._ar1_model is not None and len(iq):
+            model = self._ar1_model
+            x = iq.astype(np.complex128) - model.mean
+            previous = np.empty_like(x)
+            previous[0] = self._ar1_previous if self._ar1_previous is not None else 0
+            previous[1:] = x[:-1]
+            y = x - model.coefficient*previous
+            if not np.all(np.isfinite(y)):
+                raise ValueError("Unrepresentable AR1 residual")
+            self._ar1_previous = complex(x[-1])
+            return y  # float64 components preserve representable low physical powers
         if self._mode == "full_band" or self._sos is None:
             return iq
 
@@ -522,6 +568,10 @@ class EnergyDetector(DetectorProtocol, Resettable):
     ) -> DetectionMeasurement:
         """Process an IQBlock as a single measurement window to conform to DetectorProtocol."""
         self._validate_continuity(block, 'measurement')
+        if self._ar1_windows:
+            raise StreamConsistencyError("AR1 bank is a streaming-window API; process_windows is required")
+        if self._ar1_model is not None and self._ar1_previous is None:
+            raise StreamConsistencyError("AR1 direct measurement requires positioned predecessor warmup")
         if block.num_samples == 0:
             raise ValueError("Input IQBlock must not be empty")
 
@@ -570,12 +620,15 @@ class EnergyDetector(DetectorProtocol, Resettable):
             )
         thresholds = self._linear_thresholds(noise_estimate)
 
+        unavailable_first = self._ar1_model is not None and self._ar1_previous is None
         det_iq = self._prepare_detection_iq(block.iq)
+        if unavailable_first:
+            det_iq = det_iq[1:]  # No fictitious predecessor enters a measured window.
         self._last_detection_iq = det_iq
 
         if len(self._residual_iq) == 0:
             combined_iq = det_iq
-            start_coord = block.start_sample
+            start_coord = block.start_sample + int(unavailable_first)
         else:
             combined_iq = np.concatenate([self._residual_iq, det_iq])
             start_coord = self._residual_start_sample
@@ -603,7 +656,26 @@ class EnergyDetector(DetectorProtocol, Resettable):
             abs_win_start = start_coord + curr_rel
             abs_win_end = abs_win_start + self._window_size
 
-            measurements.append(self._measurement(block, abs_win_start, abs_win_end, p_lin, thresholds))
+            if self._ar1_windows:
+                candidates = []
+                for size in self._ar1_windows:
+                    value = window_mean_power(combined_c128[curr_rel+self._window_size-size:curr_rel+self._window_size])
+                    qon, qoff = self._ar1_quantiles[size]
+                    branch_thresholds = (thresholds[2]*qon, thresholds[2]*qoff, thresholds[2], thresholds[3])
+                    candidates.append((value,branch_thresholds,size,'ar1_innovation_power'))
+                if self._ar1_subbands:
+                    spectrum = np.fft.fft(combined_c128[curr_rel:curr_rel+self._window_size])
+                    bin_powers = (spectrum.real**2+spectrum.imag**2)/self._window_size
+                    qon,qoff = self._ar1_quantiles[32]
+                    band_thresholds = (thresholds[2]*qon,thresholds[2]*qoff,thresholds[2],thresholds[3])
+                    for bins in self._ar1_band_bins:
+                        candidates.append((float(np.mean(bin_powers[bins])),band_thresholds,self._window_size,'ar1_subband_bin_mean_power'))
+                on = [c for c in candidates if c[0] >= c[1][0]]
+                selected = max(on,key=lambda c:c[0]/c[1][0]) if on else max(candidates,key=lambda c:c[0]/c[1][1])
+                value, branch_thresholds, size, domain = selected
+                measurements.append(self._measurement(block, abs_win_end-size, abs_win_end, value, branch_thresholds,domain))
+            else:
+                measurements.append(self._measurement(block, abs_win_start, abs_win_end, p_lin, thresholds))
 
             curr_rel += self._hop_size
 
@@ -637,7 +709,7 @@ class EnergyDetector(DetectorProtocol, Resettable):
         are advanced. Every reduction uses only its own stored complex64 window.
         Configured filtering intentionally retains the reference execution path.
         """
-        if self._mode != 'full_band' or block.num_samples > 4096:
+        if self._mode != 'full_band' or self._ar1_model is not None or block.num_samples > 4096:
             raise ValueError('Full-band preparation requires at most 4096 samples')
         self._validate_continuity(block, 'streaming')
         combined = np.concatenate((self._residual_iq, block.iq)) if len(self._residual_iq) else block.iq
@@ -696,7 +768,7 @@ class EnergyDetector(DetectorProtocol, Resettable):
         Nonquiet input falls back to the ordinary chronological execution path.
         The prepared object is consumed immediately, never cached across calls.
         """
-        if self._mode != 'full_band':
+        if self._mode != 'full_band' or self._ar1_model is not None:
             return None
         self._validate_continuity(block, 'streaming')
         if not noise_estimate.valid or not math.isfinite(noise_estimate.noise_power_dbfs):
@@ -750,6 +822,7 @@ class EnergyDetector(DetectorProtocol, Resettable):
         self._residual_start_sample = 0
         self._next_window_sample = 0
         self._phase_accumulator = 0.0
+        self._ar1_previous = None
         self._input_end = self._input_stream = self._input_sequence = self._api_mode = None
         self._path_samples = 0
         if self._sos is not None:

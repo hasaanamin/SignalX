@@ -1,6 +1,7 @@
 """Signal detection package."""
 
 from signal_processing.detection.energy_detector import EnergyDetector
+from signal_processing.detection.ar_noise import AR1NoiseModel, fit_ar1_noise
 from signal_processing.detection.exceptions import (
     DetectionError,
     FilterConfigurationError,
@@ -21,6 +22,8 @@ from signal_processing.detection.profiles import (
 
 __all__ = [
     "EnergyDetector",
+    "AR1NoiseModel",
+    "fit_ar1_noise",
     "DetectionProfile",
     "AdaptiveDetectionProfile",
     "POSITIVE_SNR_IID",

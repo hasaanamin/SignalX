@@ -42,6 +42,9 @@ class CaptureSidecar:
     reopened_count: int = 0
     processing_generation: int | None = None
     detection_profile_id: str | None = None
+    coarse_detected_start_sample: int | None = None
+    coarse_detected_end_sample: int | None = None
+    boundary_method: str | None = None
 
     def with_features(
         self,
@@ -79,4 +82,7 @@ class CaptureSidecar:
             reopened_count=self.reopened_count,
             processing_generation=self.processing_generation,
             detection_profile_id=self.detection_profile_id,
+            coarse_detected_start_sample=self.coarse_detected_start_sample,
+            coarse_detected_end_sample=self.coarse_detected_end_sample,
+            boundary_method=self.boundary_method,
         )

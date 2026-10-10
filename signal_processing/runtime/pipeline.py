@@ -85,10 +85,22 @@ class StreamingCapturePipeline:
         process_workers: int = 4,
         result_order: str = 'submission',
         fixed_quiet_batch: bool = False,
+        ar1_model=None,
+        ar1_windows: tuple[int, ...] = (),
+        ar1_subbands: int = 0,
+        refine_ar1_boundaries: bool = False,
     ) -> None:
         if type(fixed_quiet_batch) is not bool:
             raise ValueError('fixed_quiet_batch must be bool')
         self._fixed_quiet_batch = fixed_quiet_batch
+        if type(refine_ar1_boundaries) is not bool or (refine_ar1_boundaries and ar1_model is None):
+            raise ValueError("AR1 refinement requires a fitted model")
+        self._ar1_model = ar1_model
+        self._refine_ar1_boundaries = refine_ar1_boundaries
+        if ar1_model is not None:
+            if (type(noise_estimator) is not GaussianNoiseEstimator or not noise_estimator.is_calibrated):
+                raise ValueError("AR1 candidate requires an explicitly fitted fixed residual reference")
+            self._fixed_quiet_batch = False
         if detection_profile_id is not None and (not isinstance(detection_profile_id, str) or not detection_profile_id.strip()):
             raise ValueError('detection_profile_id must be a nonblank string')
         if boundary_uncertainty_samples is not None and (type(boundary_uncertainty_samples) is not int or boundary_uncertainty_samples < 0):
@@ -149,6 +161,9 @@ class StreamingCapturePipeline:
             threshold_policy=threshold_policy,
             gain_id=gain_id,
             require_supported_pfa=require_supported_pfa,
+            ar1_model=ar1_model,
+            ar1_windows=ar1_windows,
+            ar1_subbands=ar1_subbands,
         )
 
         filter_delay = getattr(self._detector, "filter_delay_samples", 0)
@@ -233,6 +248,11 @@ class StreamingCapturePipeline:
                     feature_reason="Output capacity reached before analysis dispatch")
                 raise RuntimeError("Completed-capture limit reached; recover exception.completed_captures and reset")
         try:
+            if self._refine_ar1_boundaries:
+                from signal_processing.detection.boundaries import refine_ar1_capture
+                sidecar = refine_ar1_capture(sidecar, self._ar1_model, self._detector.window_size)
+                if index is not None:
+                    self._call_outputs[index] = sidecar
             result = self._analyze_event(sidecar)
         except Exception as exc:
             if index is not None:

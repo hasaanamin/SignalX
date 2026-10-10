@@ -443,12 +443,15 @@ class NoiseReferenceDomain:
     monitored_band_hz: tuple[float, float] | None = None
     filter_sos_hash: str | None = None
     gain_id: str = "digital_iq_unity"
+    preprocessing_id: str | None = None
 
     def __post_init__(self) -> None:
         fs = _validate_finite_float(self.sample_rate_hz, "sample_rate_hz")
         if fs <= 0:
             raise ContractValidationError("sample_rate_hz must be positive")
         _validate_non_blank_str(self.gain_id, "gain_id")
+        if self.preprocessing_id is not None:
+            _validate_non_blank_str(self.preprocessing_id, "preprocessing_id")
         if self.monitored_band_hz is not None:
             band = tuple(self.monitored_band_hz)
             if len(band) != 2 or not (-fs / 2 <= band[0] < band[1] <= fs / 2):
@@ -562,11 +565,14 @@ class DetectionMeasurement:
     threshold_evidence_id: str | None = None
     snr_valid: bool = True
     snr_invalid_reason: str | None = None
+    measurement_domain: str = "iq_power"
 
     def __post_init__(self) -> None:
         _validate_non_blank_str(self.stream_id, "stream_id")
         _validate_non_negative_int(self.block_sequence_number, "block_sequence_number")
         start = _validate_non_negative_int(self.start_sample, "start_sample")
+        if self.measurement_domain not in ('iq_power','ar1_innovation_power','ar1_subband_bin_mean_power'):
+            raise ContractValidationError("Unknown measurement domain")
         if self.threshold_support_method not in ('model_only', 'uncertified_training_quantile', 'held_out_clopper_pearson_bonferroni'):
             raise ContractValidationError("Unknown threshold support method")
         if self.threshold_support_method == 'held_out_clopper_pearson_bonferroni':

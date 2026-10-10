@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "signal-processing"
-version = "2.3.0"
+version = "2.4.0rc1"
 description = "Modular real-time RF signal processing and feature extraction library for LTE-targeted SDR pipelines"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -19,6 +19,13 @@ test = [
     "pytest-cov>=4.1.0",
     "ruff>=0.4.0",
 ]
+ui = [
+    "h5py>=3.10.0",
+    "matplotlib>=3.8.0",
+]
+
+[project.scripts]
+rf-pipeline-ui = "signal_processing.ui.hdf5_app:main"
 
 [tool.setuptools.packages.find]
 include = ["signal_processing*"]

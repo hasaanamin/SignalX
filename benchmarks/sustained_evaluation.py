@@ -21,6 +21,7 @@ from scipy.stats import beta, chi2
 from signal_processing.core import IQBlock, StreamInfo
 from signal_processing.detection import GaussianNoiseEstimator
 from signal_processing.runtime import StreamingCapturePipeline
+from signal_processing.runtime.scheduling import wait_until
 
 
 def match_intervals(truth, detected, minimum_iou=0.2):
@@ -40,7 +41,19 @@ def match_intervals(truth, detected, minimum_iou=0.2):
             [j for j in range(len(detected)) if j not in {p[1] for p in pairs}])
 
 
-def _pipeline(stream, *, features=False, asynchronous=False, queue_size=4, analysis_function=None):
+def _pipeline(stream, *, features=False, asynchronous=False, queue_size=4, analysis_function=None, analysis_backend='thread', fixed_quiet_batch=False):
+    if analysis_backend == 'isolated':
+        from signal_processing.runtime.isolated_capture import IsolatedCapturePipeline
+        return IsolatedCapturePipeline(stream,
+            noise_options=dict(window_size=64,calibrated_noise_power_linear=1e-4),
+            pipeline_options=dict(ring_capacity=4096,window_size=64,hop_size=32,
+                start_persistence=2,end_persistence=2,pre_trigger_samples=0,
+                pre_signal_margin_samples=0,post_signal_samples=0,min_post_trigger_samples=0,
+                max_event_samples=4096,fixed_quiet_batch=fixed_quiet_batch),
+            feature_options=dict(synchronous=not asynchronous,max_queue_size=queue_size,
+                analysis_backend='process_pool' if asynchronous else 'thread',
+                result_delivery='callbacks' if asynchronous else 'polling',analysis_function=analysis_function),
+            enable_feature_analysis=features)
     return StreamingCapturePipeline(
         stream, ring_capacity=4096, window_size=64, hop_size=32,
         noise_estimator=GaussianNoiseEstimator(window_size=64, calibrated_noise_power_linear=1e-4),
@@ -50,13 +63,16 @@ def _pipeline(stream, *, features=False, asynchronous=False, queue_size=4, analy
         synchronous_analysis=not asynchronous, max_worker_queue_size=queue_size,
         analysis_function=analysis_function,
         result_delivery='callbacks' if features and asynchronous else 'polling',
+        analysis_backend=analysis_backend,
+        fixed_quiet_batch=fixed_quiet_batch,
     )
 
 
 def bounded_acquisition(duration_seconds=5.0, *, sample_rate_hz=1e6, block_size=1024,
                         queue_capacity=16, features=False, slow_sink_seconds=0.0,
                         consumer_pause_seconds=0.0, trace_memory=False,
-                        result_sink=None, configure_pipeline=None, analysis_function=None):
+                        result_sink=None, configure_pipeline=None, analysis_function=None,
+                        analysis_backend='thread', producer_backend='thread', fixed_quiet_batch=False):
     """Independent arrival thread with drop-newest overload and truthful loss counts.
 
     A callback admitted before reset may complete after reset. The slow sink runs
@@ -65,8 +81,13 @@ def bounded_acquisition(duration_seconds=5.0, *, sample_rate_hz=1e6, block_size=
     """
     if duration_seconds <= 0 or sample_rate_hz <= 0 or block_size < 1 or queue_capacity < 1:
         raise ValueError("Duration, sample rate, block size and queue capacity must be positive")
+    if producer_backend not in ('thread', 'process'):
+        raise ValueError('producer_backend must be thread or process')
     stream = StreamInfo("bounded-acquisition", "scheduled-synthetic", sample_rate_hz)
-    pipe = _pipeline(stream, features=features, asynchronous=features, analysis_function=analysis_function)
+    initialization_start = time.perf_counter()
+    pipe = _pipeline(stream, features=features, asynchronous=features, analysis_function=analysis_function,
+                     analysis_backend=analysis_backend, fixed_quiet_batch=fixed_quiet_batch)
+    initialization_seconds = time.perf_counter() - initialization_start
     # Callback delivery is mandatory when features=True; polling is explicitly
     # optional. Do not retain recording-sized IQ or a growing event ledger.
     ledger_lock = threading.Lock()
@@ -113,7 +134,11 @@ def bounded_acquisition(duration_seconds=5.0, *, sample_rate_hz=1e6, block_size=
     if result_sink is not None:
         pipe.worker.add_result_sink(result_sink)
     if configure_pipeline is not None:
-        configure_pipeline(pipe)
+        try:
+            configure_pipeline(pipe)
+        except BaseException:
+            pipe.shutdown(timeout=5)
+            raise
     if slow_sink_seconds:
         pipe.worker.add_result_sink(lambda _: time.sleep(slow_sink_seconds))
     arrivals = queue.Queue(maxsize=queue_capacity)
@@ -124,12 +149,27 @@ def bounded_acquisition(duration_seconds=5.0, *, sample_rate_hz=1e6, block_size=
                  blocks_processed=0, deadline_misses=0, max_backlog_ms=0.0,
                  max_producer_lateness_ms=0.0, emitted_events=0, consumer_failed_samples=0,
                  consumer_processing_cpu_seconds=0.0, producer_preparation_seconds=0.0,
-                 producer_wait_seconds=0.0, producer_queue_seconds=0.0, errors=[])
+                 producer_wait_seconds=0.0, producer_queue_seconds=0.0,
+                 source_accounting_complete=True, unaccounted_samples=0, errors=[])
     latencies = collections.deque(maxlen=65536)
     processing_times = collections.deque(maxlen=65536)
     memory = []
     total = int(duration_seconds * sample_rate_hz)
     interval = block_size / sample_rate_hz
+    process_source = None
+    if producer_backend == 'process':
+        from benchmarks.process_source import ProcessScheduledSource
+        source_start = time.perf_counter()
+        try:
+            process_source = ProcessScheduledSource(stream, total, block_size, queue_capacity)
+        except BaseException:
+            # Constructor rolls back its own partially started source; the
+            # independently initialized feature worker still belongs to us.
+            pipe.shutdown(timeout=5)
+            raise
+        initialization_seconds += time.perf_counter()-source_start
+        arrivals = done = process_source
+        stop = process_source.stop
     started = time.perf_counter()
     if trace_memory:
         tracemalloc.start()
@@ -159,11 +199,7 @@ def bounded_acquisition(duration_seconds=5.0, *, sample_rate_hz=1e6, block_size=
                 iq[(indices % 4096) < 256] += 0.1
                 stats['producer_preparation_seconds'] += time.perf_counter()-preparation_start
                 wait_start = time.perf_counter()
-                while True:
-                    remaining = arrival - time.perf_counter()
-                    if remaining <= 0 or stop.wait(remaining):
-                        break
-                if stop.is_set():
+                if not wait_until(arrival, stop):
                     break
                 now = time.perf_counter()  # Recheck after every sleep, including overshoot.
                 stats['producer_wait_seconds'] += now-wait_start
@@ -194,10 +230,16 @@ def bounded_acquisition(duration_seconds=5.0, *, sample_rate_hz=1e6, block_size=
             stats["producer_finished_seconds"] = time.perf_counter() - started
             done.set()
 
-    producer = threading.Thread(target=produce, name="bounded-IQ-producer", daemon=True)
-    producer.start()
+    if process_source is None:
+        producer = threading.Thread(target=produce, name="bounded-IQ-producer", daemon=True)
+    else:
+        producer = process_source
     paused = False
     try:
+        if process_source is None:
+            producer.start()
+        else:
+            producer.start(started)
         while not done.is_set() or not arrivals.empty():
             try:
                 arrival, block = arrivals.get(timeout=0.05)
@@ -249,24 +291,47 @@ def bounded_acquisition(duration_seconds=5.0, *, sample_rate_hz=1e6, block_size=
         stop.set()
     finally:
         stop.set()
-        producer.join(timeout=2)
         undelivered = 0
-        while True:
-            try:
-                _, item = arrivals.get_nowait()
-                undelivered += item.num_samples
-                arrivals.task_done()
-            except queue.Empty:
-                break
+        try:
+            producer.join(timeout=2)
+        except Exception as exc:
+            stats['errors'].append(f'producer join: {type(exc).__name__}: {exc}')
+        try:
+            while True:
+                try:
+                    _, item = arrivals.get_nowait()
+                    undelivered += item.num_samples
+                    arrivals.task_done()
+                except queue.Empty:
+                    break
+        except Exception as exc:
+            # A dead source may raise while draining, too. Never let that
+            # secondary exception bypass worker/process cleanup below.
+            stats['errors'].append(f'input drain: {type(exc).__name__}: {exc}')
         try:
             pipe.shutdown(timeout=max(5, 6 * slow_sink_seconds))
         except Exception as exc:
             stats["errors"].append(f"shutdown: {type(exc).__name__}: {exc}")
         if trace_memory:
             tracemalloc.stop()
+    if process_source is not None:
+        try:
+            source_stats = process_source.finish()
+            stats['errors'].extend(source_stats.pop('errors'))
+            stats.update(source_stats)
+            stats['dropped_samples'] = stats['producer_deadline_dropped_samples'] + stats['queue_dropped_samples']
+        except Exception as exc:
+            stats['errors'].append(f'source cleanup: {type(exc).__name__}: {exc}')
+            stats['source_accounting_complete'] = False
     stats.update(scheduled_samples=total, sample_rate_hz=sample_rate_hz, block_size=block_size,
+                 arrival_wait_backend='time.sleep_monotonic_recheck',
+                 analysis_backend=analysis_backend, initialization_seconds=initialization_seconds,
+                 producer_backend=producer_backend,
+                 input_transport='shared_slots' if producer_backend == 'process' else 'thread_queue',
+                 fixed_quiet_batch=fixed_quiet_batch,
                  duration_seconds=duration_seconds, elapsed_seconds=time.perf_counter() - started,
-                 unproduced_samples=total-stats['produced_samples'], undelivered_admitted_samples=undelivered,
+                 unproduced_samples=(total-stats['produced_samples']
+                     if stats['source_accounting_complete'] else None), undelivered_admitted_samples=undelivered,
                  latency_ms_percentiles=np.percentile(latencies, [50, 95, 99, 100]).tolist() if latencies else [],
                  processing_ms_percentiles=np.percentile(processing_times, [50, 95, 99, 100]).tolist() if processing_times else [],
                  queue_capacity=queue_capacity, acquisition_queue_remaining=arrivals.qsize(),
@@ -274,10 +339,9 @@ def bounded_acquisition(duration_seconds=5.0, *, sample_rate_hz=1e6, block_size=
                  producer_alive=producer.is_alive(), overload_drops=pipe.worker.dropped_overload_count,
                  result_overload_drops=pipe.worker.dropped_result_overload_count,
                  memory_samples=memory, tracing_enabled=trace_memory,
-                 retained_noise_samples=len(pipe._pending_noise_buf),
-                 retained_history_samples=sum(len(x) for x in pipe._pending_noise_iq),
+                 **pipe.retention_snapshot(),
                  worker_state=pipe.worker.state.value,
-                 worker_unfinished=pipe.worker._queue.unfinished_tasks,
+                 worker_unfinished=pipe.worker.unfinished_work,
                  worker_completed=pipe.worker.completed_count,
                  worker_discarded_generation=pipe.worker.discarded_old_generation_count,
                  worker_failed=pipe.worker.failed_count,
@@ -285,13 +349,22 @@ def bounded_acquisition(duration_seconds=5.0, *, sample_rate_hz=1e6, block_size=
                  cancellation_operations=pipe.worker.cancellation_operations,
                  worker_analysis_seconds=pipe.worker.analysis_seconds, worker_sink_seconds=pipe.worker.sink_seconds,
                  retained_worker_results=len(pipe.worker.processed_results))
-    stats['producer_failed_samples'] = (stats['produced_samples']-stats['admitted_samples']
-        - stats['producer_deadline_dropped_samples']-stats['queue_dropped_samples'])
-    stats['dropped_samples'] += (stats['unproduced_samples'] + undelivered + stats['consumer_failed_samples']
-                                 + stats['producer_failed_samples'])
+    if stats['source_accounting_complete']:
+        stats['producer_failed_samples'] = (stats['produced_samples']-stats['admitted_samples']
+            - stats['producer_deadline_dropped_samples']-stats['queue_dropped_samples'])
+        stats['dropped_samples'] += (stats['unproduced_samples'] + undelivered + stats['consumer_failed_samples']
+                                     + stats['producer_failed_samples'])
+    else:
+        # Preserve observed consumption/loss but do not turn missing source
+        # evidence into falsely known expiration, queue loss or nonproduction.
+        stats['produced_samples'] = stats['admitted_samples'] = None
+        stats['producer_failed_samples'] = None
+        stats['dropped_samples'] += undelivered + stats['consumer_failed_samples']
+        stats['unaccounted_samples'] = total-stats['consumed_samples']-stats['dropped_samples']
     stats["recovered"] = (not producer.is_alive() and arrivals.empty() and arrivals.unfinished_tasks == 0
-                          and pipe.worker.state.value == 'CLOSED' and pipe.worker._queue.unfinished_tasks == 0)
-    stats["sample_accounting_balanced"] = total == stats["consumed_samples"] + stats["dropped_samples"]
+                          and pipe.worker.state.value == 'CLOSED' and pipe.worker.unfinished_work == 0)
+    stats["sample_accounting_balanced"] = (stats['source_accounting_complete'] and
+        total == stats["consumed_samples"] + stats["dropped_samples"])
     stats['delivery_scope'] = 'accepted_callbacks_and_immediate_unaccepted_returns; polling_queue_disabled' if features else 'capture_return'
     stats['delivery'] = dict(delivery, unresolved_identities=len(pending))
     stats['acquisition_passed'] = (not stats['errors'] and stats['sample_accounting_balanced'] and
@@ -303,6 +376,16 @@ def bounded_acquisition(duration_seconds=5.0, *, sample_rate_hz=1e6, block_size=
         and not any(stats[k] for k in ('worker_failed', 'worker_sink_errors', 'worker_cancelled',
                                       'worker_discarded_generation', 'overload_drops', 'cancellation_operations'))))
     stats['passed'] = all(stats[k] for k in ('acquisition_passed', 'capture_accounting_passed', 'analysis_delivery_passed', 'recovered'))
+    if pipe.worker._process_backend is not None:
+        stats['child_feature_seconds'] = pipe.worker._process_backend.child_analysis_seconds
+        stats['child_feature_cpu_seconds'] = pipe.worker._process_backend.child_cpu_seconds
+        stats['feature_roundtrip_seconds'] = pipe.worker._process_backend.roundtrip_seconds
+    if process_source is not None:
+        try:
+            process_source.close()
+        except Exception as exc:
+            stats['errors'].append(f'source close: {type(exc).__name__}: {exc}')
+            stats['recovered'] = stats['passed'] = False
     return stats
 
 

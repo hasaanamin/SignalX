@@ -81,6 +81,10 @@ class ThresholdPolicy:
                   't_on_linear', 't_off_linear', 'sample_rate_hz', 'monitored_band_hz',
                   'filter_sos_hash', 'reference_domain', 'settling_samples', 'statistic_version', 'policy_version')
         data = asdict(self)
+        # Preserve identity of historical untransformed domains. A non-null
+        # preprocessing identity is part of the validated physical statistic.
+        if data.get('reference_domain') is not None and data['reference_domain'].get('preprocessing_id') is None:
+            data['reference_domain'].pop('preprocessing_id', None)
         return hashlib.sha256(json.dumps({k: data[k] for k in fields}, sort_keys=True,
                               separators=(',', ':'), allow_nan=False).encode()).hexdigest()
 
