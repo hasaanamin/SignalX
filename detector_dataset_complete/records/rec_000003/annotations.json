@@ -1,0 +1,41 @@
+{
+  "record_id": "rec_000003",
+  "scenario": "noise_only",
+  "record_seed": 496889452,
+  "repetition": 3,
+  "sweep_snr_db": -15.0,
+  "sample_rate_hz": 1000000.0,
+  "receiver_center_frequency_hz": 915000000.0,
+  "num_samples": 131072,
+  "duration_s": 0.131072,
+  "receiver_dtype": "complex64",
+  "iq_file": "iq.npy",
+  "iq_sha256": "5a50781cbbf21f6a802820f3c88c832bd46cdfc2dbec7e8006e32cc948647274",
+  "signal_count": 0,
+  "emitters": [],
+  "interval_convention": "[start_sample, end_sample), end exclusive; times relative to this recording",
+  "background": {
+    "kind": "noise",
+    "start_sample": 0,
+    "end_sample": 131072,
+    "start_s": 0.0,
+    "end_s": 0.131072,
+    "model": "white",
+    "ar1_rho": null,
+    "expected_fullband_noise_power_linear": 0.0001,
+    "realized_fullband_noise_power_linear": 9.958935616278532e-05
+  },
+  "calibration_prefix": {
+    "start_sample": 0,
+    "end_sample": 16384,
+    "settling_samples": 2048,
+    "training_samples": 14336,
+    "noise_only": true
+  },
+  "fullband_activity_intervals": [],
+  "expected_fullband_activity_event_count": 0,
+  "cochannel_identity_resolvable_by_energy_detector": null,
+  "clipping_or_composite_normalization_applied": false,
+  "snr_semantics": "Per-emitter active power / expected FULL-BAND noise power; not detector-band SNR or SINR",
+  "emitter_interval_semantics": "Envelope from first to last nonzero placed component sample; internal waveform zeros do not split an emitter"
+}

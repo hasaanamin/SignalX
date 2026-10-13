@@ -1,0 +1,99 @@
+{
+  "record_id": "rec_000205",
+  "scenario": "single",
+  "record_seed": 2796924004,
+  "repetition": 0,
+  "sweep_snr_db": 10.0,
+  "sample_rate_hz": 1000000.0,
+  "receiver_center_frequency_hz": 915000000.0,
+  "num_samples": 131072,
+  "duration_s": 0.131072,
+  "receiver_dtype": "complex64",
+  "iq_file": "iq.npy",
+  "iq_sha256": "e23dc987389ba9b305c24f8f4af19b8502685250a9f6b3a2480f154c59bef921",
+  "signal_count": 1,
+  "emitters": [
+    {
+      "emitter_id": "rec_000205:emitter_000",
+      "modulation": "2gfsk",
+      "start_sample": 39322,
+      "end_sample": 68157,
+      "start_s": 0.039322,
+      "end_s": 0.068157,
+      "start_ms": 39.322,
+      "end_ms": 68.157,
+      "duration_samples": 28835,
+      "duration_s": 0.028835,
+      "placement_start_sample": 39322,
+      "placement_end_sample": 68157,
+      "component_array": "emitter_000",
+      "center_frequency_offset_hz": 220000.0,
+      "absolute_center_frequency_hz": 915220000.0,
+      "nominal_bandwidth_hz": 40000.0,
+      "nominal_lower_frequency_offset_hz": 200000.0,
+      "nominal_upper_frequency_offset_hz": 240000.0,
+      "bandwidth_semantics": "TorchSig generator nominal bandwidth; finite gating adds spectral tails; not certified occupied bandwidth",
+      "requested_snr_fullband_db": 10.0,
+      "measured_snr_vs_expected_noise_db": 9.999999999278087,
+      "measured_snr_vs_realized_noise_db": 10.007220970848847,
+      "active_power_linear": 0.0009999999998337736,
+      "edge_ramp_samples": 64,
+      "waveform_seed": 984134897,
+      "torchsig": {
+        "builder": "FSKSignalGenerator",
+        "torchsig_version": "2.2.0",
+        "generated_samples": 28835,
+        "interior_crop_start_sample": 0,
+        "metadata": {
+          "fsk_type": "gfsk",
+          "constellation_size": 2,
+          "sample_rate": 1000000.0,
+          "bandwidth_min": 40000,
+          "bandwidth_max": 40000,
+          "signal_duration_in_samples_min": 28835,
+          "signal_duration_in_samples_max": 28835,
+          "class_name": "2gfsk",
+          "center_freq": 0,
+          "bandwidth": 40000,
+          "duration_in_samples": 28835
+        }
+      },
+      "realized_fullband_sinr_db": 10.007220970848847
+    }
+  ],
+  "interval_convention": "[start_sample, end_sample), end exclusive; times relative to this recording",
+  "background": {
+    "kind": "noise",
+    "start_sample": 0,
+    "end_sample": 131072,
+    "start_s": 0.0,
+    "end_s": 0.131072,
+    "model": "white",
+    "ar1_rho": null,
+    "expected_fullband_noise_power_linear": 0.0001,
+    "realized_fullband_noise_power_linear": 9.975430212411356e-05
+  },
+  "calibration_prefix": {
+    "start_sample": 0,
+    "end_sample": 16384,
+    "settling_samples": 2048,
+    "training_samples": 14336,
+    "noise_only": true
+  },
+  "fullband_activity_intervals": [
+    {
+      "start_sample": 39322,
+      "end_sample": 68157,
+      "start_s": 0.039322,
+      "end_s": 0.068157,
+      "contributing_emitter_ids": [
+        "rec_000205:emitter_000"
+      ]
+    }
+  ],
+  "expected_fullband_activity_event_count": 1,
+  "cochannel_identity_resolvable_by_energy_detector": null,
+  "clipping_or_composite_normalization_applied": false,
+  "snr_semantics": "Per-emitter active power / expected FULL-BAND noise power; not detector-band SNR or SINR",
+  "emitter_interval_semantics": "Envelope from first to last nonzero placed component sample; internal waveform zeros do not split an emitter"
+}

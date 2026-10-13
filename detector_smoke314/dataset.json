@@ -1,0 +1,70 @@
+{
+  "script_version": "1.0.0",
+  "purpose": "detector evaluation",
+  "status": "COMPLETE",
+  "torchsig_version": "2.2.0",
+  "root_seed": 20261013,
+  "sample_rate_hz": 1000000.0,
+  "receiver_center_frequency_hz": 915000000.0,
+  "num_samples_per_record": 131072,
+  "scenarios": [
+    "noise_only",
+    "single",
+    "sequential",
+    "overlap_separated",
+    "simultaneous_separated",
+    "nested_near_far",
+    "cochannel_overlap",
+    "short_bursts"
+  ],
+  "modulation_classes": [
+    "bpsk",
+    "qpsk",
+    "16qam",
+    "2fsk",
+    "ofdm-64",
+    "tone"
+  ],
+  "noise_models": [
+    "white"
+  ],
+  "snr_sweep_fullband_db": [
+    0.0
+  ],
+  "repetitions_per_cell": 1,
+  "bandwidth_fractions": [
+    0.04,
+    0.08,
+    0.12
+  ],
+  "noise_dbfs": -40.0,
+  "ar1_rho": 0.8,
+  "records_expected": 8,
+  "records_completed": 8,
+  "environment": {
+    "python": "3.14.7 (tags/v3.14.7:823f032, Aug  5 2026, 10:51:32) [MSC v.1944 64 bit (AMD64)]",
+    "platform": "Windows-11-10.0.26200-SP0",
+    "packages": {
+      "torchsig": "2.2.0",
+      "torch": "2.9.1+cpu",
+      "torchaudio": "2.9.1+cpu",
+      "numpy": "2.3.5",
+      "scipy": "1.17.0",
+      "numba": "0.63.1",
+      "lightning": "2.5.3",
+      "opencv-python": "4.11.0.86"
+    }
+  },
+  "generation": "TorchSig 2.2.0 public waveform builders + controlled placement/noise wrapper",
+  "limitations": [
+    "All emitters are labeled; energy detection cannot establish their identities.",
+    "Evaluate full-band activity against the union of all emitter intervals.",
+    "Temporal coverage of nested/co-channel emitters does not prove separate detections.",
+    "Per-emitter nominal bandwidth is not a certified spectral-support or occupied-bandwidth boundary.",
+    "SNR is full-band input SNR; filtered detection-band SNR differs.",
+    "AR1 noise challenges Gaussian threshold assumptions; calibration is not Pfa certification.",
+    "Synthetic finite data is not receiver validation or a real-time performance guarantee.",
+    "Each recording starts a fresh stream at sample zero; reset the detector between files."
+  ],
+  "elapsed_generation_s": 4.633973399992101
+}

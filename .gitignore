@@ -1,0 +1,36 @@
+# Python and local environments
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.venv*/
+venv/
+*.egg-info/
+.coverage*
+htmlcov/
+
+# Generated builds, experiments, reports and archived copies
+/build/
+/dist/
+/output/
+/tmp/
+/audit_evidence/
+/audit_verification/
+/observations/
+/diffs/
+*.zip
+*.whl
+*.log
+/checks/*.json
+
+# Local credentials and editor state
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+.vscode/
+.idea/
+Thumbs.db
+.DS_Store
