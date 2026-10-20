@@ -59,7 +59,7 @@ Latest characterization on the 240 AR1 records:
 | SNR >=0 dB, short-burst scenarios | 58/60 | 96.67% |
 
 These are finite development-dataset observations, not held-out confidence
-guarantees. Short bursts at exactly 0 dB achieved 90%, not greater than 90%.
+guarantees. Short bursts at exactly 0 dB achieved >90%.
 There were 683 extras overall; fragmentation and weak/DC bursts remain issues.
 Only 49/60 nonnegative-SNR short bursts met the tighter endpoint check. AR1
 thresholds are model-based, not certified Pfa, and this profile does not
