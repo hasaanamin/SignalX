@@ -683,6 +683,7 @@ class PipelineDatasetApp:
             post_signal_samples=int(self.post_var.get()),
             min_post_trigger_samples=int(self.post_var.get()),
             adaptive_noise=bool(self.adaptive_var.get()),
+            noise_estimation_mode="legacy",
             enable_features=bool(self.features_var.get()),
         )
 
@@ -790,18 +791,22 @@ class PipelineDatasetApp:
             else "raw frame amplitude"
         )
         noise_mode = "adaptive robust" if result.config.adaptive_noise else "fixed Gaussian"
+        noise_description = (f"{result.config.noise_estimation_mode} learning from received IQ without a supplied noise reference"
+                             if result.config.noise_estimation_mode != "legacy" else
+                             f"{noise_mode} reference initialized at {result.config.noise_power_linear:.6g} linear power")
         text = (
             f"The production pipeline processed {result.total_stream_samples:,} samples in "
             f"{result.elapsed_seconds:.3f} s ({result.throughput_samples_per_second / 1e6:.3f} MS/s unpaced).\n\n"
             f"One-to-one interval matching found {result.matched_truths}/{len(result.truths)} labelled "
             f"frames, with {result.missed_truths} misses and {result.extra_events} extra events. "
-            f"The run used {mode} and a {noise_mode} reference initialized at "
-            f"{result.config.noise_power_linear:.6g} linear power. Final estimator power was "
+            f"The run used {mode} and {noise_description}. Final estimator power was "
             f"{result.final_noise_power_linear!s}.\n\n"
             "A match means the detector's physical detected interval overlaps a labelled frame and "
             "wins the one-to-one assignment. Review IoU and boundaries in Captured events; a high "
             "frame-level match rate alone does not certify exact event extent, low-SNR operation, "
             "arbitrary noise, or real-time acquisition.\n\n"
+            "This HDF5 harness constructs a stream with synthetic guards and optional label-based frame normalization; "
+            "online noise estimation does not receive those labels or the generator noise power.\n\n"
             f"Selected HDF5 rows: {', '.join(map(str, result.selected_indices[:30]))}"
             + (" …" if len(result.selected_indices) > 30 else "")
         )
@@ -1055,10 +1060,10 @@ class PipelineDatasetApp:
         self.root.destroy()
 
 
-def _headless(path: Path, frames: int) -> int:
+def _headless(path: Path, frames: int, noise_mode: str = "legacy") -> int:
     result = run_hdf5_pipeline(
         path,
-        HarnessConfig(frame_count=frames),
+        HarnessConfig(frame_count=frames, noise_estimation_mode=noise_mode),
         progress=lambda fraction, message: print(f"[{fraction:6.1%}] {message}"),
     )
     valid_features = sum(
@@ -1091,9 +1096,9 @@ def main(argv: list[str] | None = None) -> int:
         help="Detector dataset folder with manifest and supplied truth",
     )
     parser.add_argument("--csv", type=Path, help="Export smoke headless comparisons to CSV")
-    parser.add_argument("--detector-profile", default="compatibility",
-        choices=("compatibility", "ar1_whitened", "ar1_multires", "ar1_spectral"),
-        help="Detector dataset profile; AR1 candidates are offline/model-only")
+    parser.add_argument("--detector-profile", default="ar1_spectral",
+        choices=("compatibility", "ar1_whitened", "ar1_multires", "ar1_spectral", "online_gaussian", "online_ar1"),
+        help="Detector dataset profile; online_* requires no quiet-prefix metadata; all are model-only")
     parser.add_argument(
         "--headless", action="store_true", help="Run the same harness without opening Tk"
     )
@@ -1113,7 +1118,7 @@ def main(argv: list[str] | None = None) -> int:
             failures = 0
             config = SmokeConfig(detector_profile=args.detector_profile,
                 window_size=32 if args.detector_profile == "ar1_whitened" else 256,
-                hop_size=64 if args.detector_profile == "compatibility" else 8)
+                hop_size=64 if args.detector_profile in ("compatibility", "online_gaussian", "online_ar1") else 8)
             for record in inspect_smoke_dataset(args.smoke_dataset):
                 try:
                     result = compact_smoke_result(run_smoke_record(record, config))
@@ -1140,7 +1145,8 @@ def main(argv: list[str] | None = None) -> int:
                 )
                 else 0
             )
-        return _headless(args.dataset, args.frames)
+        return _headless(args.dataset, args.frames,
+                         args.detector_profile if args.detector_profile.startswith("online_") else "legacy")
     try:
         import tkinter as tk
 

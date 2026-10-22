@@ -389,10 +389,9 @@ class IQBlock:
         if type(start) is not int or type(end) is not int or not 0 <= start < end <= len(self.iq):
             raise ContractValidationError("Invalid received sub-block range")
         result = object.__new__(IQBlock)
-        for name, value in (('stream', self.stream), ('sequence_number', self.sequence_number),
-                            ('start_sample', self.start_sample+start), ('timestamp_ns', None),
-                            ('iq', self.iq[start:end]), ('dropped_samples_before', 0), ('overflow', False)):
-            object.__setattr__(result, name, value)
+        result.__dict__.update(stream=self.stream, sequence_number=self.sequence_number,
+            start_sample=self.start_sample+start, timestamp_ns=None,
+            iq=self.iq[start:end], dropped_samples_before=0, overflow=False)
         return result
 
     @property

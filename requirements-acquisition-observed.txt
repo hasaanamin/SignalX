@@ -1,0 +1,11 @@
+# Observed direct test/benchmark dependencies, not a frozen deployment sign-off.
+# Windows 11 build 26200, CPython 3.14.7, Intel Core i5-1235U.
+numpy==2.5.2
+scipy==1.18.0
+numba==0.67.0
+pyfftw==0.15.1
+llvmlite==0.49.0
+pytest==9.1.1
+psutil==7.2.2
+h5py==3.16.0
+matplotlib==3.11.1

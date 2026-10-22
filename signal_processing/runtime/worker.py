@@ -148,6 +148,11 @@ class FeatureAnalysisWorker:
                 self._state=WorkerState.CLOSED
                 raise
 
+    @property
+    def synchronous(self) -> bool:
+        """Whether submit executes analysis on its caller (immutable configuration)."""
+        return self._synchronous
+
     def _wake_locked(self):
         """Coalesce input/lifecycle readiness to ONE bounded internal byte.
 
