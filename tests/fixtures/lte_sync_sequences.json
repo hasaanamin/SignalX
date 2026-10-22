@@ -1,0 +1,10 @@
+{
+  "reference_commit": "bef8680d5f9714f3e040e6f9cbc88d7888439b6d",
+  "reference_url": "https://raw.githubusercontent.com/srsran/srsRAN_4G/bef8680d5f9714f3e040e6f9cbc88d7888439b6d/lib/src/phy/sync/gen_sss.c",
+  "reference_source_sha256": "048d102e1bdd4b6dd1e555071dac3e23b79d50701798169388fc0e7c6bfb8b97",
+  "source_license": "AGPL-3.0; downloaded reference source retains original notice; not distributed in production wheel",
+  "fixture_sha256": "629f02cf2dd8e90645cd5f325bd35495000689fe9869701d1b94353f797776bc",
+  "sss_method": "Compiled unchanged srsran_sss_generate, all 504 PCI / both half frames",
+  "pss_method": "Independent scalar cmath standard-equation implementation",
+  "not_verified": "Complete LTE transmitter/receiver, PBCH/MIB or RF hardware"
+}

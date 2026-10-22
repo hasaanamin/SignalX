@@ -1,0 +1,21 @@
+{
+  "commit": "bef8680d5f9714f3e040e6f9cbc88d7888439b6d",
+  "sources": {
+    "convcoder.c": {
+      "url": "https://raw.githubusercontent.com/srsran/srsRAN_4G/bef8680d5f9714f3e040e6f9cbc88d7888439b6d/lib/src/phy/fec/convolutional/convcoder.c",
+      "sha256": "bc861924ce88ded6cfe723383953551c59df781f1b40722033eecb34562ab037"
+    },
+    "parity.h": {
+      "url": "https://raw.githubusercontent.com/srsran/srsRAN_4G/bef8680d5f9714f3e040e6f9cbc88d7888439b6d/lib/src/phy/fec/convolutional/parity.h",
+      "sha256": "661a244dd0530ada8df4bcf22c090ad1b190a83ce2554cf0114e8f4bad6b30cd"
+    },
+    "rm_conv.c": {
+      "url": "https://raw.githubusercontent.com/srsran/srsRAN_4G/bef8680d5f9714f3e040e6f9cbc88d7888439b6d/lib/src/phy/fec/turbo/rm_conv.c",
+      "sha256": "212079120bfe3204e99d174429a6128324d9c00f8260c8b87fd28bd4b1e837c4"
+    }
+  },
+  "fixture_sha256": "ed05273e34e878f9a6e5bd02ae13facc322acf8e47575bca3024489f70d0d05c",
+  "method": "Unchanged compiled srsran_convcoder_encode and srsran_rm_conv_tx; CRC independently binascii.crc_hqx",
+  "reference_license": "AGPL-3.0; original notices retained under output; no reference C in production",
+  "scope": "90 BCH coding vectors, not a complete external LTE transmitter or RF recording"
+}
