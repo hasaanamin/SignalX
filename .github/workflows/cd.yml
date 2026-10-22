@@ -1,0 +1,176 @@
+name: SignalX CD Pipeline
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+      - 'v*.*.*-*'
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: 'Release Tag (e.g. v1.0.0-mid-eval)'
+        required: true
+        default: 'v1.0.0-mid-eval'
+
+permissions:
+  contents: write
+
+jobs:
+  build-python-distribution:
+    name: Build Python Wheels & sdist
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install build dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install build wheel
+
+      - name: Build Source Distribution and Pure Python Wheel
+        run: |
+          python -m build
+
+      - name: Upload Distribution Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: python-distributions
+          path: dist/*
+
+  package-portable-windows-bundle:
+    name: Package Portable Windows Application
+    runs-on: windows-latest
+    steps:
+      - name: Checkout repository with Git LFS
+        uses: actions/checkout@v4
+        with:
+          lfs: true
+
+      - name: Ensure Git LFS pulled
+        run: git lfs pull
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Determine Version Tag
+        id: get_version
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "TAG_NAME=${{ github.event.inputs.release_tag }}" >> $GITHUB_OUTPUT
+          else
+            echo "TAG_NAME=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Assemble Portable Package Directory
+        shell: pwsh
+        run: |
+          $ver = "${{ steps.get_version.outputs.TAG_NAME }}"
+          $distName = "SignalX-$ver-Windows-x64-Portable"
+          New-Item -ItemType Directory -Path "dist_portable\$distName" -Force | Out-Null
+          
+          # Copy source, runners, configs, docs
+          Copy-Item -Path "signal_processing" -Destination "dist_portable\$distName\signal_processing" -Recurse -Force
+          Copy-Item -Path "data" -Destination "dist_portable\$distName\data" -Recurse -Force
+          Copy-Item -Path "benchmarks" -Destination "dist_portable\$distName\benchmarks" -Recurse -Force
+          Copy-Item -Path "run_lte_ui.bat" -Destination "dist_portable\$distName\" -Force
+          Copy-Item -Path "run_detector_complete_ui.bat" -Destination "dist_portable\$distName\" -Force
+          Copy-Item -Path "README.md" -Destination "dist_portable\$distName\" -Force
+          Copy-Item -Path "pyproject.toml" -Destination "dist_portable\$distName\" -Force
+
+          # Create zip archive
+          Compress-Archive -Path "dist_portable\$distName\*" -DestinationPath "dist_portable\$distName.zip" -Force
+          
+          # Generate SHA256 Checksum
+          $hash = (Get-FileHash -Path "dist_portable\$distName.zip" -Algorithm SHA256).Hash
+          "$hash  $distName.zip" | Out-File -FilePath "dist_portable\SHA256SUMS.txt" -Encoding utf8
+
+      - name: Upload Windows Bundle Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: portable-windows-bundle
+          path: |
+            dist_portable/*.zip
+            dist_portable/SHA256SUMS.txt
+
+  publish-github-release:
+    name: Publish Official GitHub Release
+    needs: [build-python-distribution, package-portable-windows-bundle]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download Distribution Artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: python-distributions
+          path: release_assets/
+
+      - name: Download Windows Bundle Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: portable-windows-bundle
+          path: release_assets/
+
+      - name: Determine Release Tag
+        id: release_meta
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "TAG_NAME=${{ github.event.inputs.release_tag }}" >> $GITHUB_OUTPUT
+          else
+            echo "TAG_NAME=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Generate Release Notes
+        run: |
+          cat << 'EOF' > release_notes.md
+          # SignalX - Multi-Mode RF Signal Analysis & LTE Validation Platform
+
+          **Milestone**: FYP-1 Mid-Supervisory Evaluation Release
+          **Institutions**: FAST School of Computing (NUCES Islamabad) & RIMS
+          **Project Team**:
+          - Muhammad Hasaan (23i-0019) - Core Signal Processing & LTE Receiver Architecture
+          - Saleh Mubashar (23i-0724) - Real-time Streaming, SDR Acquisition & Buffering Integration
+          **Supervisor**: Dr. Hina Ayaz
+
+          ---
+
+          ### Core Deliverables Included in this Release:
+          1. **8-Step LTE DSP & Protocol Studio**:
+             - Kaiser FIR Resampling (2.0 MS/s -> 1.92 MS/s) & Native Bypass
+             - Coarse/Fine CFO Correction (+/- 45 kHz) & PSS/SSS Synchronization
+             - Physical Cell Identity (PCI) Estimation ($N_{ID}^{(1)}, N_{ID}^{(2)}$)
+             - PBCH Extraction & Channel Estimation with SFBC Equalization
+             - MIB Viterbi Decoding & CRC-16 Verification (Downlink BW, SFN, Tx Ports)
+             - PDSCH Turbo Decoding with srsRAN C Acceleration & SIB1 ASN.1 Parsing
+             - Interactive 3-Tab Live Interface (Inspector, Telemetry JSON, 60 FPS Real-Time Stream)
+          2. **Real-Time Streaming Engine**:
+             - High-throughput Ring Buffering & Zero-copy Transport
+             - Blind Online AR1 Noise Estimation & Causal Energy Detection
+             - Support for Synthetic, Replay, and Hardware SDR (ADALM-PLUTO / RTL-SDR)
+          3. **CI/CD Pipeline**:
+             - Automated Multi-OS & Multi-Python test matrices via GitHub Actions
+             - Automated package distribution (`.whl`, `.tar.gz`) and Windows portable bundles
+             - Full traceability matrix to functional requirements (FR-01 through FR-12)
+
+          ### Verification & Artifact Integrity:
+          - Over-the-air capture (`f1860_s1.92_g0_1s_strong_rtlsdr.bin`) verified against published MATLAB ground truth: **PCI 142, 2 Antennas, 20 MHz / 100 RB, SFN 589**.
+          - SHA256 checksums are attached for all binaries.
+          EOF
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.release_meta.outputs.TAG_NAME }}
+          name: SignalX Release ${{ steps.release_meta.outputs.TAG_NAME }}
+          body_path: release_notes.md
+          draft: false
+          prerelease: false
+          files: |
+            release_assets/*
