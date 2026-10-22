@@ -133,7 +133,7 @@ class AdaptiveDetectionProfile:
                      'max_event_samples','persistence','worker_capacity'):
             if type(getattr(self,name)) is not int or getattr(self,name)<1:
                 raise ValueError(f'{name} must be a positive integer')
-        if (self.sample_rate_hz != 1e6 or not 0<self.hop_size<=self.window_size
+        if (self.sample_rate_hz not in (1e6, 1_920_000.) or not 0<self.hop_size<=self.window_size
                 or not 0<self.pfa_on<self.pfa_off<1 or not math.isfinite(self.time_constant_s)
                 or self.time_constant_s<=0 or not math.isfinite(self.design_snr_db)
                 or self.minimum_burst_samples>self.maximum_qualified_burst_samples
@@ -173,3 +173,5 @@ class AdaptiveDetectionProfile:
 
 
 POSITIVE_SNR_IID = AdaptiveDetectionProfile()
+POSITIVE_SNR_IID_1920 = AdaptiveDetectionProfile(
+    name='positive_snr_iid_1920_candidate', sample_rate_hz=1_920_000.)

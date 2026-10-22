@@ -88,6 +88,24 @@ def test_replay_preserves_iq_and_measures_authorized_prefix(record):
     assert not r.display_samples.flags.writeable
 
 
+def test_online_replay_does_not_read_prefix_snr_or_ideal_power(record):
+    # A short record deliberately remains in STARTING. All truths are scored,
+    # including those during startup; missing a reference is not a fake pass.
+    config = SmokeConfig(detector_profile="online_ar1", enable_features=False)
+    first = run_smoke_record(record, config)
+    ann = json.loads(record.annotations_path.read_text())
+    ann.pop("calibration_prefix")
+    ann["sweep_snr_db"] = 999
+    ann["background"]["expected_fullband_noise_power_linear"] = 1e100
+    record.annotations_path.write_text(json.dumps(ann))
+    second = run_smoke_record(record, config)
+    assert first.metrics["online_noise"] == second.metrics["online_noise"]
+    assert first.captures == second.captures == ()
+    assert second.metrics["evaluation_start"] == 0
+    assert second.metrics["calibration_training_samples"] == 0
+    assert second.metrics["misses"] == 1
+
+
 def test_assignment_maximizes_cardinality_before_iou():
     matches = match_activity([(0, 10), (10, 20)], [(0, 20), (0, 4)], 0.2)
     assert {(i, j) for i, j, _ in matches} == {(0, 1), (1, 0)}

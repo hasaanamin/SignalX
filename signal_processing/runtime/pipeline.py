@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import enum
+import copy
 import math
 from typing import Literal
 
@@ -89,7 +90,34 @@ class StreamingCapturePipeline:
         ar1_windows: tuple[int, ...] = (),
         ar1_subbands: int = 0,
         refine_ar1_boundaries: bool = False,
+        online_noise=None,
+        feature_analysis_mode: Literal['automatic', 'on_demand'] = 'automatic',
+        ui_feature_rate_hz: float = 60.,
     ) -> None:
+        if feature_analysis_mode not in ('automatic', 'on_demand'):
+            raise ValueError('feature_analysis_mode must be automatic or on_demand')
+        if feature_analysis_mode == 'on_demand':
+            if synchronous_analysis or not enable_feature_analysis:
+                raise ValueError('on_demand requires asynchronous analysis and enabled features')
+            if (isinstance(ui_feature_rate_hz, bool) or not isinstance(ui_feature_rate_hz, (int, float))
+                    or not math.isfinite(ui_feature_rate_hz) or not 0 < ui_feature_rate_hz <= 60):
+                raise ValueError('ui_feature_rate_hz must be finite and in (0, 60]')
+        self._feature_analysis_mode = feature_analysis_mode
+        # Explicit opt-in; legacy fixed/authorized/adaptive contracts stay intact.
+        self._online_noise = None
+        if online_noise is not None:
+            from signal_processing.detection.online_noise import OnlineNoiseConfig, OnlineNoiseTracker
+            if not isinstance(online_noise, OnlineNoiseConfig):
+                raise TypeError("online_noise must be OnlineNoiseConfig")
+            if (noise_estimator is not None or ar1_model is not None or threshold_policy is not None
+                    or require_supported_pfa or detector_mode != "full_band" or ar1_windows
+                    or ar1_subbands or refine_ar1_boundaries or fixed_quiet_batch):
+                raise ValueError("Online noise owns its reference; fixed policies/SOS/banks/batching are not supported")
+            self._online_noise = OnlineNoiseTracker(stream_info.sample_rate_hz, online_noise)
+            noise_estimator = self._online_noise
+            if detection_profile_id is not None:
+                raise ValueError("Online profile identity is derived from its complete configuration")
+            detection_profile_id = online_noise.profile_id(window_size, hop_size, pfa_on, pfa_off)
         if type(fixed_quiet_batch) is not bool:
             raise ValueError('fixed_quiet_batch must be bool')
         self._fixed_quiet_batch = fixed_quiet_batch
@@ -150,7 +178,13 @@ class StreamingCapturePipeline:
         self._stream_info = stream_info
         self._state = PipelineState.OPEN
 
-        self._detector = EnergyDetector(
+        detector_class = EnergyDetector
+        detector_extra = {}
+        if self._online_noise is not None:
+            from signal_processing.detection.online_noise import OnlineEnergyDetector
+            detector_class = OnlineEnergyDetector
+            detector_extra = {"tracker": self._online_noise}
+        self._detector = detector_class(
             window_size=window_size,
             hop_size=hop_size,
             pfa_on=pfa_on,
@@ -164,7 +198,10 @@ class StreamingCapturePipeline:
             ar1_model=ar1_model,
             ar1_windows=ar1_windows,
             ar1_subbands=ar1_subbands,
+            **detector_extra,
         )
+        if self._online_noise is not None:
+            self._detector.reference_domain = self._online_noise.reference_domain
 
         filter_delay = getattr(self._detector, "filter_delay_samples", 0)
         min_required_history = (
@@ -224,6 +261,10 @@ class StreamingCapturePipeline:
         )
 
         self._enable_feature_analysis = bool(enable_feature_analysis)
+        self._feature_requests = None
+        if feature_analysis_mode == 'on_demand':
+            from signal_processing.runtime.feature_requests import FeatureRequestGate
+            self._feature_requests = FeatureRequestGate(self._worker, ui_rate_hz=ui_feature_rate_hz)
         self._previous_block: IQBlock | None = None
         self._time_anchor: tuple[int, int] | None = None
         self._noise_admission_sample: int | None = None
@@ -264,6 +305,9 @@ class StreamingCapturePipeline:
         return result
 
     def _analyze_event(self, sidecar: CaptureSidecar) -> CaptureSidecar:
+        if self._feature_analysis_mode == 'on_demand':
+            return sidecar.with_features(features=None, feature_status='skipped',
+                feature_reason='On-demand mode; raw capture delivered, no feature job requested')
         if not self._enable_feature_analysis:
             return sidecar.with_features(
                 features=None,
@@ -272,9 +316,30 @@ class StreamingCapturePipeline:
             )
         return self._worker.submit(sidecar)
 
+    def request_features(self, sidecar: CaptureSidecar, *, purpose: str = 'classification') -> CaptureSidecar:
+        """Explicit async analysis of a caller-owned capture in on-demand mode.
+
+        All raw samples still traverse detection/capture. No history is retained
+        for future requests; applications must bound their own selected history.
+        A raw acquisition gap does not cancel already accepted immutable jobs.
+        """
+        if self._feature_requests is None:
+            raise RuntimeError('request_features requires feature_analysis_mode=on_demand')
+        return self._feature_requests.request(sidecar, purpose=purpose)
+
+    @property
+    def feature_request_snapshot(self):
+        """Bounded request counters; None in legacy automatic mode."""
+        return self._feature_requests.snapshot() if self._feature_requests is not None else None
+
     @property
     def state(self) -> PipelineState:
         return self._state
+
+    @property
+    def detection_profile_id(self) -> str | None:
+        """Immutable configured statistic identity, not a confidence certificate."""
+        return self._detection_profile_id
 
     @property
     def ring_buffer(self) -> CircularIQBuffer:
@@ -456,6 +521,8 @@ class StreamingCapturePipeline:
                 pass
             else:
                 self._noise_estimator.reset()
+            if self._online_noise is not None:
+                self._detector.reference_domain = self._online_noise.reference_domain
 
             # Raw continuity changed; assembled immutable analysis jobs remain valid.
             self._ring.reset(start_sample=block.start_sample)
@@ -558,9 +625,15 @@ class StreamingCapturePipeline:
         # Bound numerical lookahead independently of caller transport size.
         # No active capture, adaptation or filtered-state lookahead is allowed.
         batch_committed = False
-        if (self._fixed_quiet_batch and 1 < num_hops and num_hops * hop_size <= 4096
+        if (self._fixed_quiet_batch and 1 < num_hops and hop_size <= 4096
                 and self._detector.mode == 'full_band'):
-            emitted.extend(self._process_full_band_batch(combined_block.slice_received(0, num_hops * hop_size)))
+            # Transport size must not disable bounded numerical preparation.
+            # Each chunk commits completely before preparing the next; a fault
+            # cannot advance filter/admission/raw state into a future chunk.
+            chunk_samples = (4096 // hop_size) * hop_size
+            for offset in range(0, num_hops * hop_size, chunk_samples):
+                end = min(num_hops * hop_size, offset + chunk_samples)
+                emitted.extend(self._process_full_band_batch(combined_block.slice_received(offset, end)))
             batch_committed = True
         for h_idx in range(0 if batch_committed else num_hops):
             h_start = h_idx * hop_size
@@ -597,6 +670,12 @@ class StreamingCapturePipeline:
                  and self._noise_estimator.state == NoiseLifecycleState.VALID)
         adaptive = type(self._noise_estimator) is AdaptiveRobustNoiseEstimator
         while offset < block.num_samples:
+            if adaptive and not self._segmenter.awaiting_off_rearm:
+                committed = self._try_adaptive_idle_transaction(block, cursor, offset)
+                if committed:
+                    offset += committed
+                    continue
+            estimate = None
             end = offset+hop
             safe_end = block.end_sample
             if adaptive:
@@ -604,6 +683,25 @@ class StreamingCapturePipeline:
                 # statistic. Received-but-undecided samples count toward age.
                 safe_end = min(safe_end, block.start_sample+offset+max(0,
                     self._noise_estimator._max_staleness_samples-self._noise_estimator.staleness_samples))
+            if ((fixed or adaptive) and self._segmenter.awaiting_off_rearm
+                    and self._segmenter.state == SegmentState.IDLE and not self._assembler.is_in_flight):
+                # A capped continuous signal cannot trigger again until OFF.
+                # Above-ON decisions all freeze the reference and advance only
+                # its received age; stop before any eligible training window.
+                estimate = self._noise_estimator.get_estimate(block.stream.stream_id, block.sequence_number)
+                on = self._detector._linear_thresholds(estimate)[0]
+                idx = cursor.index
+                limit = min(len(cursor.powers), max(0,(safe_end-base_horizon)//hop+1))
+                while idx < limit and cursor.powers[idx] >= on:
+                    idx += 1
+                if idx > cursor.index:
+                    horizon = base_horizon+(idx-1)*hop
+                    end = min(block.num_samples, ((horizon-block.start_sample+hop-1)//hop)*hop)
+                    if end > offset+hop:
+                        emitted.extend(self._process_detection_chunk(block.slice_received(offset,end),
+                            prepared=cursor, collapse_active=True, noise_estimate=estimate))
+                        offset = end
+                        continue
             if ((fixed or adaptive) and self._assembler.is_in_flight and self._segmenter.state == SegmentState.ACTIVE
                     and self._assembler.target_end_sample is None):
                 estimate = self._noise_estimator.get_estimate(block.stream.stream_id, block.sequence_number)
@@ -620,12 +718,48 @@ class StreamingCapturePipeline:
                     end = min(block.num_samples, ((horizon-block.start_sample+hop-1)//hop)*hop)
                     if end > offset+hop:
                         emitted.extend(self._process_detection_chunk(block.slice_received(offset,end),
-                            prepared=cursor, collapse_active=True))
+                            prepared=cursor, collapse_active=True, noise_estimate=estimate))
                         offset = end
                         continue
+            # Candidate confirmation and consecutive OFF persistence do not
+            # train the estimator. Commit their small received prefix once,
+            # but retain EVERY logical decision/landmark in the ordinary loop.
+            # Never cross confirmation/termination, a cap, retention or expiry.
+            if (fixed or adaptive) and not self._segmenter.awaiting_off_rearm:
+                count = 0
+                candidate = (self._segmenter.state == SegmentState.IDLE and not self._assembler.is_in_flight)
+                ending = (self._segmenter.state == SegmentState.ACTIVE and self._assembler.is_in_flight
+                          and self._assembler.target_end_sample is None)
+                if candidate or ending:
+                    if estimate is None:
+                        estimate = self._noise_estimator.get_estimate(block.stream.stream_id, block.sequence_number)
+                    on, off, *_ = self._detector._linear_thresholds(estimate)
+                    count = (self._segmenter._start_persistence-self._segmenter._on_count if candidate
+                             else self._segmenter._end_persistence-self._segmenter._off_count)
+                    # Keep this optimization small and independent of arbitrary
+                    # caller persistence settings or transport block size.
+                    if 1 < count <= 4 and cursor.index+count <= len(cursor.powers):
+                        values = cursor.powers[cursor.index:cursor.index+count]
+                        matches = all(p >= on for p in values) if candidate else all(p < off for p in values)
+                        horizon = base_horizon+(cursor.index+count-1)*hop
+                        first_start = base_horizon+cursor.index*hop-window
+                        if candidate:
+                            retain = first_start-self._assembler._pre_trigger_samples-self._assembler._pre_signal_margin_samples
+                            limit = retain+self._ring.capacity
+                        else:
+                            limit = min(self._assembler.collected_end_sample+self._ring.capacity,
+                                self._segmenter.detected_start_sample+self._segmenter._max_event_samples-1)
+                        if matches and horizon <= min(safe_end,limit) and (horizon-block.start_sample)%hop == 0:
+                            end = horizon-block.start_sample
+                            if end > offset+hop:
+                                emitted.extend(self._process_detection_chunk(block.slice_received(offset,end),
+                                    prepared=cursor,noise_estimate=estimate))
+                                offset = end
+                                continue
             if ((fixed or adaptive) and not self._assembler.is_in_flight and self._segmenter.state == SegmentState.IDLE
                     and (fixed or self._segmenter._on_count == 0)):
-                estimate = self._noise_estimator.get_estimate(block.stream.stream_id, block.sequence_number)
+                if estimate is None:
+                    estimate = self._noise_estimator.get_estimate(block.stream.stream_id, block.sequence_number)
                 # An idle noncandidate does not require BELOW-OFF: the ordinary
                 # path admits every not-ON window. Keep the stronger OFF guard
                 # while a cap rearm is pending, since an intermediate below-OFF
@@ -671,10 +805,88 @@ class StreamingCapturePipeline:
                         offset = end
                         continue
             part = block.slice_received(offset, end)
-            emitted.extend(self._process_detection_chunk(part, prepared=cursor))
+            emitted.extend(self._process_detection_chunk(part, prepared=cursor, noise_estimate=estimate))
             offset = end
         self._sync_pending_age()
         return emitted
+
+    def _try_adaptive_idle_transaction(self, block, cursor, offset=0) -> int:
+        """Preview causal idle updates, then commit one event-free raw prefix.
+
+        Only the exact built-in full-band estimator, without a threshold policy,
+        is eligible. The preview uses its ordinary fixed-M statistic, never a
+        block-wide future reference. Stop before the first possible ON decision.
+        No user callbacks, filtering, active capture or expiry may be bypassed.
+        """
+        noise = self._noise_estimator
+        hop, window = self._detector.hop_size, self._detector.window_size
+        if (type(noise) is not AdaptiveRobustNoiseEstimator or noise.state != NoiseLifecycleState.VALID
+                or self._online_noise is not None or self._detector._threshold_policy is not None
+                or self._detector._require_supported_pfa
+                or self._detector.mode != 'full_band' or self._detector._ar1_model is not None
+                or self._assembler.is_in_flight or self._segmenter.state != SegmentState.IDLE
+                or self._segmenter._on_count or self._segmenter.awaiting_off_rearm
+                # A single-update block already collapses cheaply in the
+                # ordinary loop; cloning its state would only add overhead.
+                or noise._adaptation_window_size >= (block.num_samples-offset)//2
+                or window % hop or not len(cursor.powers) or block.num_samples % hop
+                or noise.staleness_samples+block.num_samples > noise._max_staleness_samples
+                or any(name in noise.__dict__ for name in ('update_samples', 'get_estimate', 'freeze', 'set_pending_samples'))):
+            return 0
+        first_end = cursor.origin+cursor.first+window
+        if first_end+(len(cursor.powers)-1)*hop != block.end_sample:
+            return 0
+        # A possible immediate trigger uses the ordinary chronological path.
+        estimate = noise.get_estimate(block.stream.stream_id, block.sequence_number)
+        powers = np.asarray(cursor.powers)
+        if cursor.index == len(powers) or powers[cursor.index] >= self._detector._uncached_linear_thresholds(estimate)[0]:
+            return 0
+        preview = copy.copy(noise)
+        preview._history_powers = noise._history_powers.copy()
+        pending = np.concatenate((self._pending_noise_buf, block.iq[offset:]))
+        admitted = self._noise_admission_sample
+        used, idx = 0, cursor.index
+        runs = []
+        while idx < len(cursor.powers):
+            estimate = preview.get_estimate(block.stream.stream_id, block.sequence_number)
+            thresholds = self._detector._uncached_linear_thresholds(estimate)
+            boundary = admitted+preview._adaptation_window_size-len(preview._adaptation_residual)
+            stop = min(len(cursor.powers), max(idx+1, (boundary-first_end)//hop+1))
+            crossing = np.flatnonzero(powers[idx:stop] >= thresholds[0])
+            if len(crossing):
+                stop = idx+int(crossing[0])
+            if stop == idx:
+                break
+            runs.append((stop, thresholds))
+            committed_estimate = estimate
+            horizon = first_end+(stop-1)*hop
+            count = min(len(pending)-used, max(0, horizon-admitted))
+            preview.set_pending_samples(0)
+            preview.freeze(False)
+            preview.update_samples(pending[used:used+count])
+            used += count
+            admitted += count
+            idx = stop
+            if len(crossing):
+                break
+        if not runs:
+            return 0
+        end = first_end+(idx-1)*hop-block.start_sample
+        part = block.slice_received(offset, end)
+        # pending includes uncommitted future IQ; retain only the decided raw
+        # prefix's residual. Future samples re-enter through the next commit.
+        pending_end = len(self._pending_noise_buf)+part.num_samples
+        # The detector independently rechecks every threshold run before commit.
+        # Last measurement uses the reference BEFORE its own authorized update.
+        measurements = self._detector._commit_full_band(cursor, part, committed_estimate,
+            idle=True, idle_threshold_runs=tuple(runs))
+        self._ring.write_received(part)
+        noise.__dict__.update(preview.__dict__)
+        self._pending_noise_buf = pending[used:pending_end].copy()
+        self._noise_admission_sample = admitted
+        self._segmenter.update(measurements[-1])
+        self._sync_pending_age()
+        return part.num_samples
 
     def _try_quiet_batch(self, block: IQBlock) -> bool:
         if (type(self._noise_estimator) is not GaussianNoiseEstimator
@@ -718,13 +930,18 @@ class StreamingCapturePipeline:
                 len(self._pending_noise_buf) + len(self._input_residual_iq)
             )
 
-    def _process_detection_chunk(self, block: IQBlock, *, prepared=None, collapse_active=False, collapse_quiet=False) -> list[CaptureSidecar]:
+    def _process_detection_chunk(self, block: IQBlock, *, prepared=None, collapse_active=False, collapse_quiet=False, noise_estimate=None) -> list[CaptureSidecar]:
         """One chronological chunk, shared by transport, EOF and discontinuity."""
         emitted: list[CaptureSidecar] = []
         try:
             if getattr(self._noise_estimator, "state", None) == NoiseLifecycleState.STALE:
                 raise UncalibratedNoiseError("Cannot process block: noise estimator is stale")
-            if hasattr(self._noise_estimator, "get_estimate"):
+            if noise_estimate is not None:
+                # The exact built-in batch guard just obtained this immutable
+                # reference; no estimator update or external callback intervenes.
+                # Never reuse it across a commit/adaptation/callback boundary.
+                noise_est = noise_estimate
+            elif hasattr(self._noise_estimator, "get_estimate"):
                 noise_est = self._noise_estimator.get_estimate(
                     block.stream.stream_id, block.sequence_number
                 )
@@ -747,7 +964,7 @@ class StreamingCapturePipeline:
         # and adaptive/custom estimators retain the ordinary admission path.
         fixed_reference = (type(self._noise_estimator) is GaussianNoiseEstimator
                            and self._noise_estimator.state == NoiseLifecycleState.VALID)
-        if not fixed_reference:
+        if not fixed_reference and self._online_noise is None:
             self._pending_noise_buf = np.concatenate([self._pending_noise_buf, det_iq])
         if hasattr(self._noise_estimator, "set_pending_samples"):
             self._noise_estimator.set_pending_samples(0)
@@ -779,7 +996,7 @@ class StreamingCapturePipeline:
                 or self._segmenter._on_count > 0
             )
 
-            if hasattr(self._noise_estimator, "freeze"):
+            if self._online_noise is None and hasattr(self._noise_estimator, "freeze"):
                 self._noise_estimator.freeze(is_active_or_candidate)
 
             prev_state = self._segmenter.state
@@ -802,7 +1019,8 @@ class StreamingCapturePipeline:
                     detected_start_sample=self._segmenter.detected_start_sample,
                     detector_mode=self._detector.mode,
                     monitored_band_hz=self._detector.monitored_band_hz,
-                    noise_provenance=type(self._noise_estimator).__name__,
+                    noise_provenance=(type(self._noise_estimator).__name__ if self._online_noise is None else
+                        f"OnlineNoiseTracker:model_only:noise_dominated_assumption:{self._online_noise.snapshot.model_id}"),
                     noise_valid=noise_est.valid,
                     boundary_uncertainty=self._boundary_uncertainty_samples,
                     decision_horizon=horizon,
@@ -827,7 +1045,7 @@ class StreamingCapturePipeline:
                     emitted.append(analyzed)
 
             # Exact causal noise admission up to decision horizon (D01)
-            if fixed_reference:
+            if fixed_reference or self._online_noise is not None:
                 self._noise_admission_sample = horizon
                 continue
             count = min(len(self._pending_noise_buf), max(0, horizon - self._noise_admission_sample))
@@ -841,6 +1059,14 @@ class StreamingCapturePipeline:
                 else:
                     if hasattr(self._noise_estimator, "update_samples"):
                         self._noise_estimator.update_samples(chunk)
+        if self._online_noise is not None:
+            # Never use this hop to set its own decision threshold. No raw
+            # residual is transformed permanently by a changing AR coefficient.
+            eligible = (self._segmenter.state == SegmentState.IDLE and self._segmenter._on_count == 0
+                        and all(not m.above_on_threshold for m in measurements))
+            self._online_noise.observe(block.iq, eligible=eligible)
+            self._detector.reference_domain = self._online_noise.reference_domain
+            self._noise_admission_sample = block.end_sample
         self._sync_pending_age()
         return emitted
 

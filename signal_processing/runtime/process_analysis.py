@@ -8,10 +8,14 @@ or mapping proxies. IQ is copied at this boundary, not shared/recycled unsafely.
 from __future__ import annotations
 
 import dataclasses
+from functools import lru_cache
+import json
 import math
 import multiprocessing
 import pickle
+import platform
 import queue
+import sys
 import time
 
 import numpy as np
@@ -55,10 +59,20 @@ def _result(record):
     event_id, schema, values, policy, quality = record
     return AnalysisResult(FeatureVector(event_id, schema,
         {k: FeatureValue(*v) for k, v in values.items()}),
-        ExtractionPolicy.from_dict(policy), CaptureQuality(**quality))
+        _policy_from_json(json.dumps(policy, sort_keys=True, allow_nan=False)), CaptureQuality(**quality))
 
 
-def _serve(connection, readiness=None):
+@lru_cache(maxsize=32)
+def _policy_from_json(canonical):
+    """Bounded immutable configuration cache, never event IQ/features/results.
+
+    Key is the ENTIRE canonical content, not its caller-provided policy ID.
+    Any edited field is revalidated, including same-ID contradictory records.
+    """
+    return ExtractionPolicy.from_dict(json.loads(canonical))
+
+
+def _serve(connection, readiness=None, completion_token=None):
     """Spawn-safe entry point. No caller functions or open application resources."""
     try:
         from signal_processing.features import FeatureAggregator, build_default_feature_registry
@@ -94,12 +108,18 @@ def _serve(connection, readiness=None):
                 payload = pickle.dumps((_PROTOCOL, token,
                     ('error', 'Result exceeds bounded 48 KiB transport envelope')), protocol=5)
             connection.send_bytes(payload)
+            if completion_token is not None:
+                # Single-writer aligned int64 on x86-64 Windows. Publish only
+                # AFTER the entire bounded reply has crossed the pipe writer.
+                completion_token.value = token
             if readiness is not None:
                 readiness.set()
     except (EOFError, BrokenPipeError, OSError):
         pass
     finally:
         connection.close()
+        if completion_token is not None:
+            completion_token.value = -1
         if readiness is not None:
             try: readiness.set()
             finally: readiness.close()
@@ -121,8 +141,21 @@ class ProcessAnalysisBackend:
         self.roundtrip_seconds = 0.0
         self._token = 0
         ctx = multiprocessing.get_context('spawn')
+        # The Windows pipe reserves 64 KiB and responses are <=48 KiB, so a
+        # full reply fits without a reader draining it before publication. Do
+        # NOT use this optimization on smaller pipes/other memory models.
+        from multiprocessing.connection import BUFSIZE
+        self._completion_token = (ctx.RawValue('q', 0)
+            if sys.platform == 'win32' and sys.maxsize > 2**32
+            and platform.machine().upper() in ('AMD64', 'X86_64')
+            and BUFSIZE >= MAX_RESPONSE_BYTES+8 else None)
+        if self._completion_token is not None:
+            import ctypes
+            if ctypes.addressof(self._completion_token) % 8:
+                self._completion_token = None
+        self._last_health_check = 0.
         self._connection, child = ctx.Pipe()
-        self._process = ctx.Process(target=_serve, args=(child, readiness), name='RF-default-features', daemon=True)
+        self._process = ctx.Process(target=_serve, args=(child, readiness, self._completion_token), name='RF-default-features', daemon=True)
         started = time.monotonic()
         try:
             self._process.start()
@@ -154,6 +187,8 @@ class ProcessAnalysisBackend:
             raise RuntimeError('Feature process already has an outstanding transaction')
         if context.event.num_samples > MAX_PROCESS_EVENT_SAMPLES:
             raise ValueError('Process feature backend supports at most 4096 captured IQ samples; use thread backend for larger events')
+        if self._token >= 2**63-1:
+            raise RuntimeError('Feature transaction counter exhausted; recreate backend')
         self._token += 1
         payload=pickle.dumps((_PROTOCOL,self._token,_request(context)),protocol=5)
         if len(payload)>MAX_REQUEST_BYTES:
@@ -167,13 +202,28 @@ class ProcessAnalysisBackend:
             raise
 
     def ready(self):
+        if getattr(self, '_pending_since', None) is None:
+            return False
+        if self._completion_token is not None:
+            if self._completion_token.value in (self._token, -1):
+                return True
+            now = time.perf_counter()
+            if now-self._pending_since >= self.timeout:
+                return True
+            # Abrupt death cannot publish the flag. Keep bounded liveness
+            # checks, without a PeekNamedPipe/GIL handoff on every scan.
+            if now-self._last_health_check >= .05:
+                self._last_health_check = now
+                return not self._process.is_alive()
+            return False
         return (self._connection.poll(0) or not self._process.is_alive()
                 or time.perf_counter()-self._pending_since >= self.timeout)
 
     def finish(self):
         try:
             remaining = max(0., self.timeout-(time.perf_counter()-self._pending_since))
-            if not self._connection.poll(remaining):
+            published = self._completion_token is not None and self._completion_token.value == self._token
+            if not published and not self._connection.poll(remaining):
                 raise TimeoutError('Feature process calculation timed out')
             version, token, response = self._connection.recv()
             if version != _PROTOCOL or token != self._token:

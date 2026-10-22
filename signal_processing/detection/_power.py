@@ -33,4 +33,9 @@ def window_mean_powers(iq128: np.ndarray, size: int, hop: int) -> np.ndarray:
     windows = np.ndarray((count,size), dtype=powers.dtype, buffer=powers,
                          strides=(hop*powers.itemsize,powers.itemsize))
     windows.flags.writeable = False
-    return windows.mean(axis=1)
+    # The dtype, reduction axis and row size are already established here.
+    # This is NumPy mean's same nonnegative pairwise sum and division, without
+    # repeating its general axis/count/dtype dispatch for every transport block.
+    result = windows.sum(axis=1)
+    result /= size
+    return result

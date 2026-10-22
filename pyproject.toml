@@ -14,7 +14,12 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+acceleration = ["numba>=0.67,<0.68", "pyfftw>=0.15.1,<0.16", "psutil>=7,<8"]
+pluto = ["pyadi-iio>=0.0.20,<0.1", "pylibiio>=0.25,<1"]
 test = [
+    "numba>=0.67,<0.68",
+    "pyfftw>=0.15.1,<0.16",
+    "psutil>=7,<8",
     "pytest>=8.0.0",
     "pytest-cov>=4.1.0",
     "ruff>=0.4.0",
@@ -26,6 +31,11 @@ ui = [
 
 [project.scripts]
 rf-pipeline-ui = "signal_processing.ui.hdf5_app:main"
+rf-lte-ui = "signal_processing.ui.lte_app:main"
+rf-lte-sync = "signal_processing.lte.cli:main"
+rf-adaptive = "signal_processing.runtime.adaptive_cli:main"
+rf-pluto = "signal_processing.runtime.pluto_cli:main"
+
 
 [tool.setuptools.packages.find]
 include = ["signal_processing*"]

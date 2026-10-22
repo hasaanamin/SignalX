@@ -42,7 +42,7 @@ class SmokePanel(ttk.Frame):
             name: tk.StringVar(value=str(value))
             for name, value in (
                 ("window_size", 256),
-                ("hop_size", 64),
+                ("hop_size", 8),
                 ("block_size", 1024),
                 ("pre_trigger_samples", 256),
                 ("post_trigger_samples", 256),
@@ -51,7 +51,7 @@ class SmokePanel(ttk.Frame):
             )
         }
         self.features = tk.BooleanVar(value=True)
-        self.detector_profile = tk.StringVar(value="compatibility")
+        self.detector_profile = tk.StringVar(value="ar1_spectral")
         self.export_mode = tk.StringVar(value="combined")
         self._build()
         self.after(100, self._poll)
@@ -96,7 +96,7 @@ class SmokePanel(ttk.Frame):
             ttk.Entry(options, textvariable=variable, width=11).grid(row=1, column=col, padx=5)
         ttk.Label(options, text="Detector profile", style="Body.TLabel").grid(row=0, column=7, padx=5)
         profile = ttk.Combobox(options, textvariable=self.detector_profile,
-            values=("compatibility", "ar1_whitened", "ar1_multires", "ar1_spectral"),
+            values=("compatibility", "ar1_whitened", "ar1_multires", "ar1_spectral", "online_gaussian", "online_ar1"),
             width=19, state="readonly")
         profile.grid(row=1, column=7, padx=5)
         profile.bind("<<ComboboxSelected>>", self._profile_changed)
@@ -125,8 +125,8 @@ class SmokePanel(ttk.Frame):
         ttk.Button(actions, text="Export CSV", command=self.export).pack(side="right")
         ttk.Label(
             self,
-            text="Original IQ • fresh pipeline per record • measured noise-only warmup • "
-            "ON 1e-4 / OFF 1e-2 model targets • compatibility assumes white noise; AR1 profiles fit the quiet prefix • NOT certified Pfa • offline replay",
+            text="Original IQ • online_* learns from IQ without a quiet-prefix label; legacy profiles use prefix calibration • "
+            "ON 1e-4 / OFF 1e-2 model targets • NOT certified Pfa • offline replay is not timing qualification",
             style="Muted.TLabel",
         ).grid(row=3, column=0, sticky="w", pady=5)
         ttk.Label(self, textvariable=self.status, style="Body.TLabel", wraplength=1250).grid(
@@ -312,7 +312,7 @@ class SmokePanel(ttk.Frame):
 
     def _profile_changed(self, _event=None):
         self.values["window_size"].set("32" if self.detector_profile.get() == "ar1_whitened" else "256")
-        self.values["hop_size"].set("64" if self.detector_profile.get() == "compatibility" else "8")
+        self.values["hop_size"].set("64" if self.detector_profile.get() in ("compatibility", "online_gaussian", "online_ar1") else "8")
 
     def run(self):
         if self.thread and self.thread.is_alive():
@@ -523,7 +523,7 @@ class SmokePanel(ttk.Frame):
             "end",
             "Emitter fields are supplied ground truth. Coverage means detected activity, "
             "not classification or source separation. Capture margins are excluded from detection scoring.\n"
-            "All ends are exclusive. Sample metrics exclude the authorized calibration prefix.\n"
+            "All ends are exclusive. Online profiles score from sample zero (including startup); legacy profiles exclude their calibration prefix.\n"
             "A missing sample-precision/recall denominator is N/A, not 100%.\n\n",
         )
         if result:
@@ -542,13 +542,16 @@ class SmokePanel(ttk.Frame):
             top.plot(
                 result.display_samples * scale, result.display_magnitude, color="#386780", lw=0.6
             )
-        top.axvspan(
-            0,
-            a["calibration_prefix"]["end_sample"] * scale,
-            color="gray",
-            alpha=0.2,
-            label="Calibration",
-        )
+        online = (result.config.detector_profile if result else self.detector_profile.get()).startswith("online_")
+        if online:
+            learned = result.metrics.get("online_noise", {}) if result else {}
+            learning_end = learned.get("first_reference_received_samples")
+            if result:
+                top.axvspan(0, (learning_end or a["num_samples"])*scale,
+                            color="gray", alpha=.2, label="Online learning (scored)")
+        elif "calibration_prefix" in a:
+            top.axvspan(0, a["calibration_prefix"]["end_sample"]*scale,
+                        color="gray", alpha=.2, label="Authorized calibration")
         for i, t in enumerate(a["fullband_activity_intervals"]):
             top.axvspan(
                 t["start_sample"] * scale,

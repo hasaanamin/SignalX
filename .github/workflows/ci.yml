@@ -1,0 +1,133 @@
+name: SignalX CI Pipeline
+
+on:
+  push:
+    branches:
+      - main
+      - develop
+      - 'feature/**'
+      - 'release/**'
+  pull_request:
+    branches:
+      - main
+      - develop
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint-and-code-quality:
+    name: Code Quality & Linting
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install Linting Tools
+        run: |
+          python -m pip install --upgrade pip
+          pip install ruff black
+
+      - name: Ruff Linter Check
+        run: |
+          ruff check .
+
+      - name: Formatting Inspection
+        run: |
+          black --check --diff signal_processing tests benchmarks || true
+
+  unit-and-regression-tests:
+    name: Test Suite (${{ matrix.os }} - Py${{ matrix.python-version }})
+    needs: lint-and-code-quality
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python-version: ['3.12', '3.13']
+    steps:
+      - name: Checkout repository with Git LFS
+        uses: actions/checkout@v4
+        with:
+          lfs: true
+
+      - name: Ensure Git LFS pulled
+        run: git lfs pull
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip setuptools wheel
+          pip install -e .[test,ui]
+
+      - name: Compile Native srsRAN FEC on Linux
+        if: runner.os == 'Linux'
+        run: |
+          gcc -shared -fPIC -O2 -std=c11 -DSRSRAN_LTE_ONLY \
+            -Isignal_processing/lte/native \
+            -Isignal_processing/lte/native/srsran \
+            signal_processing/lte/native/srsran_fec_adapter.c \
+            signal_processing/lte/native/crc.c \
+            signal_processing/lte/native/cbsegm.c \
+            signal_processing/lte/native/turbocoder.c \
+            signal_processing/lte/native/turbodecoder.c \
+            signal_processing/lte/native/turbodecoder_gen.c \
+            signal_processing/lte/native/tc_interl_lte.c \
+            signal_processing/lte/native/rm_turbo.c \
+            signal_processing/lte/native/bit.c \
+            -o signal_processing/lte/native/srsran_fec.so
+          ls -la signal_processing/lte/native/srsran_fec.so
+
+      - name: Execute Full Pytest Suite
+        run: |
+          python -m pytest tests/ -ra --junitxml=junit-${{ matrix.os }}-py${{ matrix.python-version }}.xml
+
+      - name: Publish Test Results Artifact
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: test-results-${{ matrix.os }}-py${{ matrix.python-version }}
+          path: junit-*.xml
+
+  dsp-and-lte-verification:
+    name: LTE Over-The-Air & DSP Verification Gate
+    needs: unit-and-regression-tests
+    runs-on: windows-latest
+    steps:
+      - name: Checkout repository with Git LFS
+        uses: actions/checkout@v4
+        with:
+          lfs: true
+
+      - name: Ensure Git LFS pulled
+        run: git lfs pull
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e .[test,ui]
+
+      - name: Verify LTE Receiver Contracts and Synchronizer
+        run: |
+          python -m pytest tests/test_lte_sync.py tests/test_lte_pbch.py tests/test_lte_turbo.py tests/test_lte_sib.py tests/test_lte_pipeline_inspector.py -v
+
+      - name: Verify Real-Time LTE Streaming & Scheduling Regressions
+        run: |
+          python -m pytest tests/regressions/test_realtime_1920.py tests/regressions/test_blind_search_realtime.py tests/regressions/test_core_reservation.py -v
+

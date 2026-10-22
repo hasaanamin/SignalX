@@ -73,6 +73,7 @@ class HarnessConfig:
     pfa_on: float = 1e-4
     pfa_off: float = 1e-2
     adaptive_noise: bool = True
+    noise_estimation_mode: str = "legacy"
     adaptation_window_size: int = 64
     start_persistence: int = 2
     end_persistence: int = 3
@@ -87,6 +88,8 @@ class HarnessConfig:
     display_point_limit: int = 60_000
 
     def __post_init__(self) -> None:
+        if self.noise_estimation_mode not in ("legacy", "online_gaussian", "online_ar1"):
+            raise ValueError("Unknown noise_estimation_mode")
         positive_ints = (
             "frame_count",
             "transport_block_size",
@@ -423,7 +426,12 @@ def run_hdf5_pipeline(
         center_frequency_hz=config.center_frequency_hz,
         channel_id="hdf5-test-harness",
     )
-    if config.adaptive_noise:
+    online_config = None
+    if config.noise_estimation_mode != "legacy":
+        from signal_processing.detection import OnlineNoiseConfig
+        online_config = OnlineNoiseConfig(model="gaussian" if config.noise_estimation_mode == "online_gaussian" else "ar1")
+        estimator = None
+    elif config.adaptive_noise:
         estimator = AdaptiveRobustNoiseEstimator(
             window_size=config.window_size,
             pfa_on=config.pfa_on,
@@ -460,6 +468,7 @@ def run_hdf5_pipeline(
         synchronous_analysis=True,
         skip_incomplete_quality=False,
         enable_feature_analysis=config.enable_features,
+        online_noise=online_config,
     )
     captures: list[CaptureSidecar] = []
     blocks = math.ceil(len(stream_iq) / config.transport_block_size)
@@ -515,7 +524,7 @@ def run_hdf5_pipeline(
         total_stream_samples=len(stream_iq),
         elapsed_seconds=elapsed,
         throughput_samples_per_second=len(stream_iq) / elapsed if elapsed else math.inf,
-        final_noise_power_linear=getattr(estimator, "noise_power_linear", None),
+        final_noise_power_linear=getattr(pipeline.noise_estimator, "noise_power_linear", None),
         display_sample_indices=display_indices,
         display_magnitudes=display_magnitudes,
     )

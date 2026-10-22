@@ -10,6 +10,8 @@ from .exceptions import StreamConsistencyError
 
 
 def require_stream(actual: StreamInfo, expected: StreamInfo, *, bind_center=False) -> StreamInfo:
+    if actual is expected:
+        return expected
     candidate = expected
     if bind_center and expected.center_frequency_hz is None:
         candidate = replace(expected, center_frequency_hz=actual.center_frequency_hz)

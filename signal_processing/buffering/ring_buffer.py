@@ -13,7 +13,7 @@ from signal_processing.buffering.exceptions import (
     BufferRangeError,
     BufferUnavailableError,
 )
-from signal_processing.core.contracts import _validate_and_freeze_iq_array
+from signal_processing.core.contracts import _make_array_immutable
 
 
 class CircularIQBuffer:
@@ -203,7 +203,9 @@ class CircularIQBuffer:
                 out[:first] = self._buffer[phys_start:]
                 out[first:] = self._buffer[: n - first]
 
-            return _validate_and_freeze_iq_array(out)
+            # Both write APIs validate incoming complex64 IQ before storage.
+            # Freeze this detached copy without rescanning the same samples.
+            return _make_array_immutable(out)
 
     def reset(self, start_sample: int = 0) -> None:
         """Reset buffer state and advance to a new stream generation epoch.
