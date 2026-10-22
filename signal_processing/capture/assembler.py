@@ -6,7 +6,7 @@ import numpy as np
 
 from signal_processing.buffering.ring_buffer import CircularIQBuffer
 from signal_processing.capture.sidecar import CaptureSidecar
-from signal_processing.core.contracts import SignalEvent, StreamInfo, _validate_and_freeze_iq_array
+from signal_processing.core.contracts import SignalEvent, StreamInfo
 
 
 class EventAssembler:
@@ -350,8 +350,6 @@ class EventAssembler:
                 f"act_start={act_start}, trig={trig}, det_end={det_end}, act_end={act_end}"
             )
 
-        event_iq = _validate_and_freeze_iq_array(full_iq)
-
         # Derive event timestamp from anchor if available
         event_ts_ns: int | None = None
         if self._anchor_start_sample is not None and self._anchor_timestamp_ns is not None:
@@ -370,7 +368,9 @@ class EventAssembler:
         event = SignalEvent(
             event_id=self._event_id,
             stream=self._stream_info,
-            iq=event_iq,
+            # SignalEvent validates and freezes once. An extra pre-validation
+            # here used to scan/copy the complete capture a second time.
+            iq=full_iq,
             event_start_sample=act_start,
             event_end_sample=act_end,
             detected_start_sample=det_start,

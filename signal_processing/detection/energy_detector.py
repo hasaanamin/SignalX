@@ -721,7 +721,8 @@ class EnergyDetector(DetectorProtocol, Resettable):
                               self._input_end, self._residual_iq, self._next_window_sample,
                               self._threshold_policy)
 
-    def _commit_full_band(self, cursor, block, noise_estimate, *, quiet=False, active=False, idle=False):
+    def _commit_full_band(self, cursor, block, noise_estimate, *, quiet=False, active=False, idle=False,
+                          idle_threshold_runs=None):
         """Commit only the next received prefix, with the reference valid NOW.
 
         A failed threshold check leaves the cursor and detector untouched. Future
@@ -743,7 +744,17 @@ class EnergyDetector(DetectorProtocol, Resettable):
         stop = min(len(cursor.powers), max(0, (block.end_sample-cursor.origin-cursor.first-self._window_size)//self._hop_size+1))
         if quiet and any(p >= thresholds[1] for p in cursor.powers[cursor.index:stop]):
             raise ValueError('Cannot collapse nonquiet decisions')
-        if idle and any(p >= thresholds[0] for p in cursor.powers[cursor.index:stop]):
+        if idle_threshold_runs is not None:
+            if not idle or quiet or active or self._threshold_policy is not None:
+                raise ValueError('Threshold runs require policy-free idle processing')
+            begin = cursor.index
+            for last, run in idle_threshold_runs:
+                if not begin < last <= stop or any(p >= run[0] for p in cursor.powers[begin:last]):
+                    raise ValueError('Invalid causal idle threshold run')
+                begin = last
+            if begin != stop or not idle_threshold_runs or idle_threshold_runs[-1][1] != thresholds:
+                raise ValueError('Incomplete causal idle threshold runs')
+        elif idle and any(p >= thresholds[0] for p in cursor.powers[cursor.index:stop]):
             raise ValueError('Cannot collapse above-ON idle decisions')
         if active and any(p < thresholds[1] for p in cursor.powers[cursor.index:stop]):
             raise ValueError('Cannot collapse a below-OFF active decision')

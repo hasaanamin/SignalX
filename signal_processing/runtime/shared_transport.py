@@ -10,12 +10,14 @@ reconstructs a validated immutable IQBlock. Metadata uses signed int64 indexes.
 """
 import queue
 import sys
+import time
 
 import numpy as np
 
 
 class SharedIQTransport:
-    def __init__(self, context, capacity, max_samples):
+    def __init__(self, context, capacity, max_samples, *, measure_timing=False):
+        if type(measure_timing) is not bool: raise ValueError('measure_timing must be bool')
         if type(capacity) is not int or capacity < 1 or type(max_samples) is not int or max_samples < 1:
             raise ValueError('Transport capacity and max_samples must be positive integers')
         if sys.maxsize<=2**32:
@@ -24,6 +26,8 @@ class SharedIQTransport:
         self._bytes = context.RawArray('B', capacity*max_samples*8)
         self._metadata = context.RawArray('q', capacity*4)
         self._arrivals = context.RawArray('d', capacity)
+        self._publication_times=context.RawArray('d',capacity) if measure_timing else None
+        self.last_publication_monotonic=None
         self._free = context.Semaphore(capacity)
         self._ready = context.Semaphore(0)
         # Each aligned int64 counter has ONE writer: publication by producer,
@@ -57,6 +61,8 @@ class SharedIQTransport:
             np.frombuffer(self._bytes,dtype=np.uint8)[offset:offset+len(data)] = np.frombuffer(data,dtype=np.uint8)
             self._metadata[slot*4:slot*4+4] = (n,seq,start,lost)
             self._arrivals[slot] = arrival
+            if self._publication_times is not None:
+                self._publication_times[slot]=time.perf_counter()
             self._write += 1
             self._counts[0] = self._write
         except BaseException:
@@ -72,6 +78,8 @@ class SharedIQTransport:
         offset = slot*self.max_samples*8
         data = np.frombuffer(self._bytes,dtype=np.uint8)[offset:offset+max(0,n)*8].tobytes()
         arrival = self._arrivals[slot]
+        if self._publication_times is not None:
+            self.last_publication_monotonic=self._publication_times[slot]
         self._read += 1
         self._counts[1] = self._read
         self._free.release()
@@ -103,3 +111,4 @@ class SharedIQTransport:
         # Call only after the peer has exited. Shared ctypes allocations release
         # their OS mappings when the final owning process drops its references.
         self._bytes = self._metadata = self._arrivals = None
+        self._publication_times=None

@@ -7,6 +7,7 @@ all submitted records have crossed the feeder. Capacity remains 16 by default.
 import math
 import multiprocessing
 import queue
+import sys
 import time
 
 import numpy as np
@@ -48,6 +49,12 @@ def _run(connection, output, stop, total, block_size, rate):
     lost = 0
     try:
         generator = _ScheduledIQ(block_size)
+        import psutil
+        own=psutil.Process()
+        stats['producer_ready_rss_bytes']=own.memory_info().rss
+        stats['producer_ready_threads']=own.num_threads()
+        stats['producer_loaded_scipy']='scipy' in sys.modules
+        stats['producer_loaded_features']='signal_processing.features' in sys.modules
         connection.send(('ready', None))
         started = connection.recv()
         cpu = time.thread_time()
@@ -107,12 +114,12 @@ def _run(connection, output, stop, total, block_size, rate):
 
 
 class ProcessScheduledSource:
-    def __init__(self, stream, total, block_size, capacity, transport='shared'):
+    def __init__(self, stream, total, block_size, capacity, transport='shared', *, measure_timing=False):
         self.stream = stream
         ctx = multiprocessing.get_context('spawn')
         if transport == 'shared':
             from signal_processing.runtime.shared_transport import SharedIQTransport
-            self._queue = SharedIQTransport(ctx, capacity, block_size)
+            self._queue = SharedIQTransport(ctx, capacity, block_size,measure_timing=measure_timing)
         elif transport == 'pickle':
             self._queue = ctx.JoinableQueue(capacity)
         else:

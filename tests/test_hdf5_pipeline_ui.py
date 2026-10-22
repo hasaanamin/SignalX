@@ -91,6 +91,20 @@ def test_filters_and_random_selection_are_reproducible(tmp_path) -> None:
     assert all(sidecar.feature_status == "skipped" for sidecar in first.captures)
 
 
+def test_online_hdf5_path_does_not_construct_seeded_reference(tmp_path, monkeypatch):
+    import signal_processing.ui.hdf5_runner as runner
+    path = tmp_path / "online.h5"
+    _dataset(path, frames=8)
+    def forbidden(*args, **kwargs):
+        raise AssertionError("Online mode must not construct a supplied-power estimator")
+    monkeypatch.setattr(runner, "GaussianNoiseEstimator", forbidden)
+    monkeypatch.setattr(runner, "AdaptiveRobustNoiseEstimator", forbidden)
+    result = run_hdf5_pipeline(path, HarnessConfig(frame_count=8, noise_estimation_mode="online_ar1", enable_features=False))
+    assert result.final_noise_power_linear is not None
+    assert result.final_noise_power_linear == pytest.approx(1e-4, rel=.2)
+    assert result.captures
+
+
 def test_cancellation_before_admission_is_explicit(tmp_path) -> None:
     path = tmp_path / "test.h5"
     _dataset(path)

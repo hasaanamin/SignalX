@@ -66,7 +66,7 @@ class SmokeConfig:
             raise ValueError("Minimum IoU must be in (0, 1]")
         if type(self.enable_features) is not bool:
             raise ValueError("enable_features must be bool")
-        if self.detector_profile not in ("compatibility", "ar1_whitened", "ar1_multires", "ar1_spectral"):
+        if self.detector_profile not in ("compatibility", "ar1_whitened", "ar1_multires", "ar1_spectral", "online_gaussian", "online_ar1"):
             raise ValueError("Unknown detector profile")
         if self.detector_profile in ("ar1_multires", "ar1_spectral") and (self.window_size != 256 or self.hop_size != 8):
             raise ValueError("AR1 multires candidate requires N=256/H=8, with 32/64/256 subwindows")
@@ -219,7 +219,7 @@ def _interval(row: dict, size: int) -> tuple[int, int]:
     return a, b
 
 
-def _validated_record(record: SmokeRecord):
+def _validated_record(record: SmokeRecord, *, require_prefix=True):
     annotations = json.loads(record.annotations_path.read_text(encoding="utf-8-sig"))
     if annotations["record_id"] != record.record_id:
         raise ValueError("Manifest/annotation record identity mismatch")
@@ -232,11 +232,11 @@ def _validated_record(record: SmokeRecord):
     digest = hashlib.sha256(memoryview(iq).cast("B")).hexdigest()
     if digest != record.iq_sha256 or digest != annotations["iq_sha256"]:
         raise ValueError("IQ payload checksum does not match supplied manifest and annotations")
-    prefix = annotations["calibration_prefix"]
-    if prefix.get("noise_only") is not True or prefix["start_sample"] != 0:
+    prefix = annotations.get("calibration_prefix", {}) if require_prefix else {}
+    if require_prefix and (prefix.get("noise_only") is not True or prefix["start_sample"] != 0):
         raise ValueError("An explicitly authorized noise-only prefix starting at zero is required")
-    settling, training = prefix["settling_samples"], prefix["training_samples"]
-    if (
+    settling, training = prefix.get("settling_samples", 0), prefix.get("training_samples", 0)
+    if require_prefix and (
         type(settling) is not int
         or type(training) is not int
         or settling < 0
@@ -252,7 +252,7 @@ def _validated_record(record: SmokeRecord):
     expected_counts = np.zeros(len(iq), dtype=np.int32)
     for emitter in annotations["emitters"]:
         a, b = _interval(emitter, len(iq))
-        if a < prefix["end_sample"]:
+        if require_prefix and a < prefix["end_sample"]:
             raise ValueError("Emitter truth contradicts noise-only calibration prefix")
         expected_counts[a:b] += 1
     truth = np.zeros(len(iq), dtype=bool)
@@ -281,8 +281,10 @@ def run_smoke_record(
     cancel_event: threading.Event | None = None,
 ) -> SmokeResult:
     config = config or SmokeConfig()
-    iq, annotations, truth, intervals = _validated_record(record)
-    prefix = annotations["calibration_prefix"]
+    online = config.detector_profile in ("online_gaussian", "online_ar1")
+    iq, annotations, truth, intervals = _validated_record(record, require_prefix=not online)
+    # Online execution does not even read the calibration-prefix annotation.
+    prefix = dict(training_samples=0, settling_samples=0, end_sample=0) if online else annotations["calibration_prefix"]
     stream = StreamInfo(
         record.record_id,
         record.iq_path.parents[2].name,
@@ -297,9 +299,14 @@ def run_smoke_record(
         warmup_settling_samples=prefix["settling_samples"],
     )
     ar1_model = None
+    online_config = None
     start_at = 0
     profile_id = None
-    if config.detector_profile != "compatibility":
+    if online:
+        from signal_processing.detection.online_noise import OnlineNoiseConfig
+        online_config = OnlineNoiseConfig(model="gaussian" if config.detector_profile == "online_gaussian" else "ar1")
+        estimator = None
+    elif config.detector_profile != "compatibility":
         from signal_processing.detection.ar_noise import fit_ar1_noise
         ar1_model = fit_ar1_noise(iq[prefix["settling_samples"]:prefix["end_sample"]], stream.sample_rate_hz)
         domain = NoiseReferenceDomain(stream.sample_rate_hz, preprocessing_id=ar1_model.model_id)
@@ -332,6 +339,7 @@ def run_smoke_record(
         ar1_windows=(32,64,256) if config.detector_profile in ("ar1_multires","ar1_spectral") else (),
         ar1_subbands=8 if config.detector_profile=="ar1_spectral" else 0,
         refine_ar1_boundaries=config.detector_profile in ("ar1_multires","ar1_spectral"),
+        online_noise=online_config,
     )
     captures = []
     started = time.perf_counter()
@@ -372,13 +380,15 @@ def run_smoke_record(
     metrics = dict(
         detector_profile=config.detector_profile,
         ar1_model=ar1_model.to_dict() if ar1_model else None,
-        detection_profile_id=profile_id,
+        detection_profile_id=pipeline.detection_profile_id,
         noise_model=annotations["background"]["model"],
         sweep_snr_db=annotations.get("sweep_snr_db"),
         repetition=annotations.get("repetition"),
-        threshold_assumptions_match=ar1_model is not None or annotations["background"]["model"] == "white",
+        threshold_assumptions_match=(online_config.model == "ar1" or annotations["background"]["model"] == "white") if online else
+            ar1_model is not None or annotations["background"]["model"] == "white",
         ar1_diagnostics_are_not_certification=ar1_model is not None,
-        threshold_support=("Fitted AR1 innovations; model only, parameter uncertainty and Pfa NOT certified" if ar1_model is not None else
+        threshold_support=("Blind online Gaussian/AR1 tracking; noise-dominated occupancy assumption; Pfa NOT certified" if online else
+            "Fitted AR1 innovations; model only, parameter uncertainty and Pfa NOT certified" if ar1_model is not None else
             "Gaussian model only; no held-out certification" if annotations["background"]["model"] == "white" else
             "MODEL MISMATCH: iid Gaussian thresholds on correlated AR1; stress comparison only"),
         samples=len(iq),
@@ -402,8 +412,9 @@ def run_smoke_record(
         emitter_coverage=emitter_coverage,
         elapsed_seconds=elapsed,
         throughput_samples_per_second=len(iq) / elapsed,
-        calibrated_noise_power=estimator.noise_power_linear,
+        calibrated_noise_power=pipeline.noise_estimator.noise_power_linear,
         calibration_training_samples=prefix["training_samples"],
+        online_noise=pipeline.noise_estimator.diagnostics() if online else None,
         feature_failures=sum(c.feature_status == "failed" for c in captures),
         exact_capture_iq=all(
             np.array_equal(c.event.iq, iq[c.event.event_start_sample : c.event.event_end_sample])

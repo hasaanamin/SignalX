@@ -7,6 +7,7 @@ from typing import Any
 import numpy as np
 
 from signal_processing.core.contracts import IQBlock, StreamInfo, _validate_and_freeze_iq_array
+from signal_processing.core.timebase import sample_offset_ns
 
 
 class ArrayIQSource:
@@ -60,8 +61,8 @@ class ArrayIQSource:
 
         block_ts_ns: int | None = None
         if self._start_timestamp_ns is not None:
-            offset_s = self._cursor / self._stream_info.sample_rate_hz
-            block_ts_ns = self._start_timestamp_ns + int(round(offset_s * 1e9))
+            block_ts_ns = self._start_timestamp_ns + sample_offset_ns(
+                self._cursor, self._stream_info.sample_rate_hz)
 
         block = IQBlock(
             stream=self._stream_info,
